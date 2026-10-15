@@ -7,6 +7,29 @@ import time
 import json
 import math
 import altair as alt
+import logging
+import os
+import sys
+
+# Configure standard logging to console and mtg_app.log
+LOG_FILE = "mtg_app.log"
+logger = logging.getLogger("mtg_inventory")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    # File handler
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh.setFormatter(file_formatter)
+    logger.addHandler(fh)
+
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    console_formatter = logging.Formatter("%(asctime)s [%(levelname)s]: %(message)s", datefmt="%H:%M:%S")
+    ch.setFormatter(console_formatter)
+    logger.addHandler(ch)
 
 DB_NAME = "mtg_inventory.db"
 SCRYFALL_HEADERS = {
@@ -221,130 +244,240 @@ def save_to_card_cache(card_data):
     conn.close()
 
 
+def _parse_scryfall_card_json(data, fallback_name=""):
+    """Extracts structured card dictionary from a Scryfall JSON object."""
+    faces_list = []
+    if "card_faces" in data and len(data["card_faces"]) >= 2:
+        for f in data["card_faces"]:
+            f_img = f.get("image_uris", {}).get("normal")
+            if not f_img:
+                f_img = f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(f.get('name', ''))}&format=image"
+            f_kw = f.get("keywords", [])
+            f_kw_str = ", ".join(f_kw) if isinstance(f_kw, list) else str(f_kw or "")
+            faces_list.append({
+                "name": f.get("name", ""),
+                "mana_cost": f.get("mana_cost", ""),
+                "type_line": f.get("type_line", ""),
+                "oracle_text": f.get("oracle_text", ""),
+                "image_url": f_img,
+                "power": f.get("power", ""),
+                "toughness": f.get("toughness", ""),
+                "loyalty": f.get("loyalty", ""),
+                "defense": f.get("defense", ""),
+                "cmc": f.get("cmc", 0.0),
+                "keywords": f_kw_str
+            })
+    faces_json_str = json.dumps(faces_list) if faces_list else None
+
+    img = data.get("image_uris", {}).get("normal")
+    if not img and faces_list:
+        img = faces_list[0]["image_url"]
+    if not img:
+        img = f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(data.get('name', fallback_name))}&format=image"
+
+    mana_cost = data.get("mana_cost", "")
+    if not mana_cost and faces_list:
+        mana_cost = faces_list[0].get("mana_cost", "")
+
+    oracle_text = data.get("oracle_text", "")
+    if not oracle_text and faces_list:
+        oracle_text = " // \n".join([f.get("oracle_text", "") for f in faces_list if f.get("oracle_text")])
+
+    keywords_val = data.get("keywords", [])
+    if not keywords_val and "card_faces" in data:
+        face_kws = []
+        for f in data["card_faces"]:
+            for kw in f.get("keywords", []):
+                if kw not in face_kws:
+                    face_kws.append(kw)
+        keywords_val = face_kws
+    keywords_str = ", ".join(keywords_val) if isinstance(keywords_val, list) else str(keywords_val or "")
+
+    produced_mana_val = data.get("produced_mana", [])
+    if not produced_mana_val and "card_faces" in data:
+        f_prod = []
+        for f in data["card_faces"]:
+            for pm in f.get("produced_mana", []):
+                if pm not in f_prod:
+                    f_prod.append(pm)
+        produced_mana_val = f_prod
+    produced_mana_str = ",".join(produced_mana_val) if isinstance(produced_mana_val, list) else str(produced_mana_val or "")
+
+    return {
+        "name": data.get("name", fallback_name),
+        "cmc": data.get("cmc", 0.0),
+        "type_line": data.get("type_line", ""),
+        "color_identity": ",".join(data.get("color_identity", [])),
+        "image_url": img,
+        "mana_cost": mana_cost,
+        "oracle_text": oracle_text,
+        "keywords": keywords_str,
+        "faces_json": faces_json_str,
+        "faces": faces_list,
+        "produced_mana": produced_mana_str
+    }
+
+
 def fetch_scryfall_data(card_name):
     """
     Fetch card metadata from local cache first.
     Queries Scryfall API ONLY initially if the card is not already cached.
+    Supports exact match, fuzzy fallback, and rate limit backoff.
     """
+    if not card_name or not str(card_name).strip():
+        return None
+    card_name = str(card_name).strip()
     cached = get_cached_card(card_name)
     if cached:
         return cached
 
     # Query Scryfall API with custom headers and timeout
-    try:
-        url = f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(str(card_name).strip())}"
-        resp = requests.get(url, headers=SCRYFALL_HEADERS, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
+    logger.info(f"Querying Scryfall API for card: '{card_name}'")
+    for attempt in range(2):
+        try:
+            # 1. Try exact match
+            url = f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(card_name)}"
+            resp = requests.get(url, headers=SCRYFALL_HEADERS, timeout=8)
+            
+            if resp.status_code == 429:
+                wait_time = 1.5 * (attempt + 1)
+                logger.warning(f"Scryfall 429 Rate Limit hit for '{card_name}'. Backing off {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+                
+            if resp.status_code == 404:
+                # 2. Try fuzzy match fallback
+                logger.info(f"Exact match 404 for '{card_name}', attempting fuzzy match...")
+                time.sleep(0.1)
+                url_fuzzy = f"https://api.scryfall.com/cards/named?fuzzy={requests.utils.quote(card_name)}"
+                resp = requests.get(url_fuzzy, headers=SCRYFALL_HEADERS, timeout=8)
+                if resp.status_code == 429:
+                    time.sleep(1.5)
+                    continue
 
-            # Handle double-faced cards (Transform, MDFC, Flip, Battles)
-            faces_list = []
-            if "card_faces" in data and len(data["card_faces"]) >= 2:
-                for f in data["card_faces"]:
-                    f_img = f.get("image_uris", {}).get("normal")
-                    if not f_img:
-                        f_img = f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(f.get('name', ''))}&format=image"
-                    f_kw = f.get("keywords", [])
-                    f_kw_str = ", ".join(f_kw) if isinstance(f_kw, list) else str(f_kw or "")
-                    faces_list.append({
-                        "name": f.get("name", ""),
-                        "mana_cost": f.get("mana_cost", ""),
-                        "type_line": f.get("type_line", ""),
-                        "oracle_text": f.get("oracle_text", ""),
-                        "image_url": f_img,
-                        "power": f.get("power", ""),
-                        "toughness": f.get("toughness", ""),
-                        "loyalty": f.get("loyalty", ""),
-                        "defense": f.get("defense", ""),
-                        "cmc": f.get("cmc", 0.0),
-                        "keywords": f_kw_str
-                    })
-            faces_json_str = json.dumps(faces_list) if faces_list else None
-
-            img = data.get("image_uris", {}).get("normal")
-            if not img and faces_list:
-                img = faces_list[0]["image_url"]
-            if not img:
-                img = f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(data.get('name', card_name))}&format=image"
-
-            mana_cost = data.get("mana_cost", "")
-            if not mana_cost and faces_list:
-                mana_cost = faces_list[0].get("mana_cost", "")
-
-            oracle_text = data.get("oracle_text", "")
-            if not oracle_text and faces_list:
-                oracle_text = " // \n".join([f.get("oracle_text", "") for f in faces_list if f.get("oracle_text")])
-
-            keywords_val = data.get("keywords", [])
-            if not keywords_val and "card_faces" in data:
-                face_kws = []
-                for f in data["card_faces"]:
-                    for kw in f.get("keywords", []):
-                        if kw not in face_kws:
-                            face_kws.append(kw)
-                keywords_val = face_kws
-            keywords_str = ", ".join(keywords_val) if isinstance(keywords_val, list) else str(keywords_val or "")
-
-            produced_mana_val = data.get("produced_mana", [])
-            if not produced_mana_val and "card_faces" in data:
-                f_prod = []
-                for f in data["card_faces"]:
-                    for pm in f.get("produced_mana", []):
-                        if pm not in f_prod:
-                            f_prod.append(pm)
-                produced_mana_val = f_prod
-            produced_mana_str = ",".join(produced_mana_val) if isinstance(produced_mana_val, list) else str(produced_mana_val or "")
-
-            ret_data = {
-                "name": data.get("name"),
-                "cmc": data.get("cmc", 0.0),
-                "type_line": data.get("type_line", ""),
-                "color_identity": ",".join(data.get("color_identity", [])),
-                "image_url": img,
-                "mana_cost": mana_cost,
-                "oracle_text": oracle_text,
-                "keywords": keywords_str,
-                "faces_json": faces_json_str,
-                "faces": faces_list,
-                "produced_mana": produced_mana_str
-            }
-
-            # Cache locally to prevent future API calls
-            save_to_card_cache(ret_data)
-
-            # If this card exists in the collection table, update cached fields
-            try:
-                conn_up = sqlite3.connect(DB_NAME)
-                cur_up = conn_up.cursor()
-                cur_up.execute("""
-                    UPDATE collection 
-                    SET cmc = COALESCE(cmc, ?),
-                        type_line = CASE WHEN type_line IS NULL OR type_line = '' THEN ? ELSE type_line END,
-                        color_identity = CASE WHEN color_identity IS NULL OR color_identity = '' THEN ? ELSE color_identity END,
-                        image_url = CASE WHEN image_url IS NULL OR image_url = '' THEN ? ELSE image_url END,
-                        mana_cost = CASE WHEN mana_cost IS NULL OR mana_cost = '' THEN ? ELSE mana_cost END,
-                        oracle_text = CASE WHEN ? != '' THEN ? ELSE oracle_text END,
-                        keywords = CASE WHEN ? != '' THEN ? ELSE keywords END,
-                        faces_json = CASE WHEN ? IS NOT NULL AND ? != '' THEN ? ELSE faces_json END,
-                        produced_mana = CASE WHEN ? != '' THEN ? ELSE produced_mana END
-                    WHERE card_name = ? OR card_name LIKE ?
-                """, (ret_data["cmc"], ret_data["type_line"], ret_data["color_identity"],
-                      ret_data["image_url"], ret_data["mana_cost"],
-                      oracle_text, oracle_text,
-                      keywords_str, keywords_str,
-                      faces_json_str, faces_json_str,
-                      produced_mana_str, produced_mana_str,
-                      ret_data["name"], card_name))
-                conn_up.commit()
-                conn_up.close()
-            except Exception:
-                pass
-
-            return ret_data
-    except Exception:
-        pass
+            if resp.status_code == 200:
+                data = resp.json()
+                ret_data = _parse_scryfall_card_json(data, fallback_name=card_name)
+                save_to_card_cache(ret_data)
+                logger.info(f"Successfully fetched and cached '{ret_data['name']}' from Scryfall.")
+                return ret_data
+            else:
+                logger.warning(f"Scryfall returned status {resp.status_code} for '{card_name}'.")
+                break
+        except Exception as e:
+            logger.error(f"Error querying Scryfall for '{card_name}': {e}")
+            break
 
     return None
+
+
+def batch_fetch_scryfall_cards(card_names):
+    """
+    Batches lookups for multiple cards using Scryfall's /cards/collection endpoint.
+    Batches in chunks of up to 75, respects rate limits (0.12s wait between requests),
+    handles 429 backoff, falls back to fuzzy single lookup for not_found cards,
+    and returns a dict of {canonical_name: card_data}.
+    """
+    if not card_names:
+        return {}
+
+    # Deduplicate while preserving order
+    unique_names = []
+    seen = set()
+    for name in card_names:
+        clean = str(name).strip()
+        if clean and clean.lower() not in seen:
+            seen.add(clean.lower())
+            unique_names.append(clean)
+
+    results = {}
+    missing_from_cache = []
+
+    # 1. Check local cache first
+    for name in unique_names:
+        cached = get_cached_card(name)
+        if cached:
+            results[cached["name"]] = cached
+            results[name] = cached
+        else:
+            missing_from_cache.append(name)
+
+    logger.info(f"Batch fetch: {len(unique_names)} total cards ({len(results)} from cache, {len(missing_from_cache)} to fetch from Scryfall)")
+
+    if not missing_from_cache:
+        return results
+
+    # 2. Chunk into batches of up to 75 (Scryfall limit is 75)
+    batch_size = 75
+    batches = [missing_from_cache[i:i + batch_size] for i in range(0, len(missing_from_cache), batch_size)]
+
+    for b_idx, batch in enumerate(batches):
+        payload = {"identifiers": [{"name": n} for n in batch]}
+        headers = {**SCRYFALL_HEADERS, "Content-Type": "application/json"}
+        
+        logger.info(f"Sending batch {b_idx + 1}/{len(batches)} ({len(batch)} cards) to Scryfall /cards/collection...")
+        
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.post("https://api.scryfall.com/cards/collection", headers=headers, json=payload, timeout=12)
+                if resp.status_code == 429:
+                    wait_sec = 2.0 * (attempt + 1)
+                    logger.warning(f"Scryfall 429 rate limit hit on batch {b_idx + 1}. Waiting {wait_sec}s...")
+                    time.sleep(wait_sec)
+                    continue
+                break
+            except Exception as e:
+                logger.error(f"Exception during Scryfall batch {b_idx + 1}: {e}")
+                time.sleep(1.0)
+                
+        if resp and resp.status_code == 200:
+            res_json = resp.json()
+            data_list = res_json.get("data", [])
+            for c_obj in data_list:
+                parsed = _parse_scryfall_card_json(c_obj)
+                save_to_card_cache(parsed)
+                results[parsed["name"]] = parsed
+                # Also map against raw requested name
+                for req_n in batch:
+                    req_clean = req_n.strip().lower()
+                    card_clean = parsed["name"].strip().lower()
+                    if req_clean == card_clean or card_clean.startswith(req_clean + " //"):
+                        results[req_n] = parsed
+                        
+            # Handle not_found fallback with individual fuzzy queries
+            not_found = res_json.get("not_found", [])
+            if not_found:
+                logger.info(f"Batch {b_idx + 1}: {len(not_found)} cards not found in batch collection. Trying individual fallback with delay...")
+                for nf in not_found:
+                    nf_name = nf.get("name", "")
+                    if nf_name:
+                        time.sleep(0.15)  # 150ms delay between fallbacks to prevent 429
+                        single_card = fetch_scryfall_data(nf_name)
+                        if single_card:
+                            results[single_card["name"]] = single_card
+                            results[nf_name] = single_card
+        else:
+            logger.error(f"Batch {b_idx + 1} failed with status: {resp.status_code if resp else 'No Response'}. Falling back to individual queries...")
+            for card_n in batch:
+                time.sleep(0.15)
+                single_card = fetch_scryfall_data(card_n)
+                if single_card:
+                    results[single_card["name"]] = single_card
+                    results[card_n] = single_card
+
+        # Courtesy delay between Scryfall collection batch petitions (120ms)
+        time.sleep(0.12)
+
+    logger.info(f"Batch fetch complete. Successfully resolved {len(results)} card references.")
+    return results
+
+
+def get_card_image_url(card_name, stored_url=None):
+    """Returns valid image URL, falling back to Scryfall direct named image redirect."""
+    if stored_url and isinstance(stored_url, str) and stored_url.strip():
+        return stored_url
+    return f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(str(card_name))}&format=image"
 
 
 def get_card_display_details(card_name, card_info, scope="default"):
@@ -457,23 +590,16 @@ def get_commander_partner_type(cmdr_data):
     return None
 
 
-def get_card_image_url(card_name, stored_url=None):
-    """Returns valid image URL, falling back to Scryfall direct named image redirect."""
-    if stored_url and isinstance(stored_url, str) and stored_url.strip():
-        return stored_url
-    return f"https://api.scryfall.com/cards/named?exact={requests.utils.quote(str(card_name))}&format=image"
-
-
 CATEGORY_ORDER = [
-    ("Creatures", "⚔️"),
-    ("Planeswalkers", "🧙"),
-    ("Instants", "⚡"),
-    ("Sorceries", "📜"),
-    ("Artifacts", "🛡️"),
-    ("Enchantments", "🔮"),
-    ("Battles", "💥"),
-    ("Lands", "🏔️"),
-    ("Other", "📦"),
+    ("Creatures", ""),
+    ("Planeswalkers", ""),
+    ("Instants", ""),
+    ("Sorceries", ""),
+    ("Artifacts", ""),
+    ("Enchantments", ""),
+    ("Battles", ""),
+    ("Lands", ""),
+    ("Other", ""),
 ]
 
 
@@ -502,14 +628,86 @@ def get_card_category(type_line):
 
 
 def parse_card_line(line):
-    """Parses lines like '4 Sol Ring', '1x Counterspell', or 'Brainstorm'."""
-    line = line.strip()
+    """
+    Parses lines like '4 Sol Ring', '1x Counterspell', '1 Sol Ring (CMR) 351 *F*',
+    or 'Brainstorm'. Returns (qty, clean_card_name) or None if line is empty or comment.
+    """
     if not line:
         return None
-    match = re.match(r"^(\d+)\s*x?\s+(.+)$", line, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), match.group(2).strip()
-    return 1, line  # Default to 1 copy if no quantity is specified
+    raw = str(line).strip()
+    if not raw:
+        return None
+    # Strip comments and section headers like '// Commander', '# Sideboard', etc.
+    if raw.startswith("//") or raw.startswith("#"):
+        return None
+    # Strip trailing comments
+    raw = re.split(r'\s+//', raw)[0].strip()
+    raw = re.split(r'\s+#', raw)[0].strip()
+    if not raw:
+        return None
+
+    qty = 1
+    m = re.match(r"^(\d+)\s*x?\s+(.+)$", raw, re.IGNORECASE)
+    if m:
+        qty = int(m.group(1))
+        name_part = m.group(2).strip()
+    else:
+        name_part = raw
+
+    # Strip set codes & collector numbers e.g. "(CMR) 351", "[NEO] 22", "(MH2)"
+    name_part = re.sub(r'\s*[\(\[][A-Za-z0-9_]{2,6}[\)\]](\s*\S+)?', '', name_part).strip()
+    # Strip foil / etched tags e.g. *F*, *foil*, #foil
+    name_part = re.sub(r'[\*#].*$', '', name_part).strip()
+    # Normalize split cards slash "Fire / Ice" -> "Fire // Ice"
+    if "/" in name_part and "//" not in name_part:
+        name_part = re.sub(r'\s*/\s*', ' // ', name_part).strip()
+
+    if not name_part:
+        return None
+    return qty, name_part
+
+
+def parse_decklist_text(text):
+    """
+    Parses full decklist text, detecting Commander headers/flags and cleaning card names.
+    Returns: {'commanders': [name1, ...], 'cards': [(qty, name), ...]}
+    """
+    lines = text.strip().splitlines()
+    commanders = []
+    cards = []
+    in_commander_section = False
+
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            if commanders:
+                in_commander_section = False
+            continue
+
+        if re.match(r'^(//\s*commander|\[commander\]|commander:)', raw, re.IGNORECASE):
+            in_commander_section = True
+            cmdr_inline = re.sub(r'^(//\s*commander:?|\[commander\]|commander:)\s*', '', raw, flags=re.IGNORECASE).strip()
+            if cmdr_inline:
+                res_c = parse_card_line(cmdr_inline)
+                if res_c:
+                    commanders.append(res_c[1])
+                    cards.append(res_c)
+            continue
+
+        if raw.startswith("//") or raw.startswith("#"):
+            in_commander_section = False
+            continue
+
+        res = parse_card_line(raw)
+        if not res:
+            continue
+        qty, name = res
+        if in_commander_section or '*cmdr*' in raw.lower() or '*commander*' in raw.lower():
+            if name not in commanders:
+                commanders.append(name)
+        cards.append((qty, name))
+
+    return {'commanders': commanders, 'cards': cards}
 
 
 def run_query(query, params=()):
@@ -527,6 +725,7 @@ def execute_db(query, params=()):
         conn.commit()
         return True
     except Exception as e:
+        logger.error(f"Database error executing query '{query}': {e}", exc_info=True)
         st.error(f"Database error: {e}")
         return False
     finally:
@@ -555,8 +754,113 @@ def add_card_to_collection(card_name, qty):
         """, (name, qty, card_data["cmc"], card_data["type_line"], card_data["color_identity"],
               card_data.get("image_url"), card_data.get("mana_cost"), card_data.get("oracle_text", ""), card_data.get("keywords", ""),
               card_data.get("faces_json"), card_data.get("produced_mana", ""), qty))
+        logger.info(f"Added {qty}x '{name}' to collection.")
         return name
     return None
+
+
+def batch_add_cards_to_collection(parsed_items):
+    """
+    Batches lookups using Scryfall batch collection API and updates the collection in a single transaction.
+    parsed_items: list of (qty, card_name)
+    Returns: (successful_list, failed_list)
+    """
+    if not parsed_items:
+        return [], []
+
+    # Aggregate quantities for duplicate names
+    qty_map = {}
+    for qty, name in parsed_items:
+        clean_n = str(name).strip()
+        if clean_n:
+            qty_map[clean_n] = qty_map.get(clean_n, 0) + int(qty)
+
+    all_names = list(qty_map.keys())
+    logger.info(f"Starting batch collection add for {len(all_names)} unique card entries...")
+
+    card_data_map = batch_fetch_scryfall_cards(all_names)
+
+    successful = []
+    failed = []
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    try:
+        for name, qty in qty_map.items():
+            card_info = card_data_map.get(name)
+            if not card_info:
+                # Try case-insensitive lookup in map
+                for k, v in card_data_map.items():
+                    if k.lower() == name.lower():
+                        card_info = v
+                        break
+
+            if card_info:
+                canonical = card_info["name"]
+                cursor.execute("""
+                    INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(card_name) DO UPDATE SET 
+                        total_owned = total_owned + ?,
+                        cmc = excluded.cmc,
+                        type_line = excluded.type_line,
+                        color_identity = excluded.color_identity,
+                        image_url = CASE WHEN excluded.image_url IS NOT NULL AND excluded.image_url != '' THEN excluded.image_url ELSE collection.image_url END,
+                        mana_cost = CASE WHEN excluded.mana_cost IS NOT NULL AND excluded.mana_cost != '' THEN excluded.mana_cost ELSE collection.mana_cost END,
+                        oracle_text = CASE WHEN excluded.oracle_text IS NOT NULL AND excluded.oracle_text != '' THEN excluded.oracle_text ELSE collection.oracle_text END,
+                        keywords = CASE WHEN excluded.keywords IS NOT NULL AND excluded.keywords != '' THEN excluded.keywords ELSE collection.keywords END,
+                        faces_json = CASE WHEN excluded.faces_json IS NOT NULL AND excluded.faces_json != '' THEN excluded.faces_json ELSE collection.faces_json END,
+                        produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END
+                """, (canonical, qty, card_info["cmc"], card_info["type_line"], card_info["color_identity"],
+                      card_info.get("image_url"), card_info.get("mana_cost"), card_info.get("oracle_text", ""), card_info.get("keywords", ""),
+                      card_info.get("faces_json"), card_info.get("produced_mana", ""), qty))
+                successful.append({"Card": canonical, "Qty Added": qty})
+            else:
+                failed.append({"Card": name, "Qty": qty})
+
+        conn.commit()
+        logger.info(f"Batch collection add complete: {len(successful)} added, {len(failed)} failed.")
+    except Exception as e:
+        logger.error(f"Error during batch collection insert: {e}", exc_info=True)
+        conn.rollback()
+    finally:
+        conn.close()
+
+    return successful, failed
+
+
+def set_deck_commander(deck_id, card_name, is_partner=False):
+    """
+    Sets the commander (or partner/background) for a deck.
+    Ensures exactly 1 copy is present in deck_cards without duplicating it
+    if it is already present in the deck.
+    """
+    card_data = fetch_scryfall_data(card_name)
+    if not card_data:
+        logger.warning(f"Could not set commander: '{card_name}' not found on Scryfall.")
+        return None
+
+    canonical_name = card_data["name"]
+    col_name = "partner_commander" if is_partner else "commander"
+
+    # 1. Update deck metadata
+    execute_db(f"UPDATE decks SET {col_name} = ? WHERE id = ?", (canonical_name, deck_id))
+
+    # 2. Ensure exactly 1 copy in deck_cards (keep existing if already 1, don't increment to 2!)
+    existing_in_deck = run_query("SELECT quantity FROM deck_cards WHERE deck_id = ? AND card_name = ?", (deck_id, canonical_name))
+    if existing_in_deck.empty:
+        execute_db("INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, 1)", (deck_id, canonical_name))
+    else:
+        execute_db("UPDATE deck_cards SET quantity = 1 WHERE deck_id = ? AND card_name = ?", (deck_id, canonical_name))
+
+    # 3. Ensure card exists in collection
+    existing_in_col = run_query("SELECT total_owned FROM collection WHERE card_name = ?", (canonical_name,))
+    if existing_in_col.empty:
+        add_card_to_collection(canonical_name, 1)
+
+    logger.info(f"Set {col_name}='{canonical_name}' for deck_id={deck_id} (singleton copy verified).")
+    return card_data
 
 
 BASIC_LAND_COLORS = {
@@ -1116,6 +1420,44 @@ def calculate_balanced_land_base(target_total_lands, df_deck, commander_ci=None,
     }
 
 
+def render_cmdr_picker_inputs(deck_id, df_deck, key_prefix="cmdr"):
+    """
+    Renders standardized inputs to pick a commander from:
+    1. Cards currently in this deck (legendaries first)
+    2. Cards in collection
+    3. Custom card name entry
+    Returns the chosen card name string.
+    """
+    deck_card_opts = ["-- Select from Cards in this Deck --"]
+    if not df_deck.empty:
+        leg_deck = df_deck[df_deck['type_line'].str.contains("Legendary", case=False, na=False) | df_deck['type_line'].str.contains("Planeswalker", case=False, na=False)]
+        other_deck = df_deck[~df_deck['card_name'].isin(leg_deck['card_name'])]
+        deck_card_opts += leg_deck['card_name'].tolist() + other_deck['card_name'].tolist()
+
+    leg_df = run_query("SELECT card_name FROM collection WHERE (type_line LIKE '%Legendary%Creature%' OR type_line LIKE '%Planeswalker%') ORDER BY card_name ASC")
+    leg_opts = ["-- Select from Collection --"] + (leg_df['card_name'].tolist() if not leg_df.empty else [])
+
+    c_p1, c_p2 = st.columns(2)
+    with c_p1:
+        if len(deck_card_opts) > 1:
+            ch_deck = st.selectbox("From Cards in this Deck", deck_card_opts, key=f"{key_prefix}_deck_{deck_id}")
+        else:
+            ch_deck = "-- Select from Cards in this Deck --"
+        ch_leg = st.selectbox("From Collection", leg_opts, key=f"{key_prefix}_leg_{deck_id}")
+    with c_p2:
+        ch_custom = st.text_input("Or enter Card Name", placeholder="e.g. Atraxa, Praetors' Voice", key=f"{key_prefix}_custom_{deck_id}")
+
+    picked = ""
+    if ch_custom.strip():
+        picked = ch_custom.strip()
+    elif ch_deck != "-- Select from Cards in this Deck --":
+        picked = ch_deck
+    elif ch_leg != "-- Select from Collection --":
+        picked = ch_leg
+
+    return picked
+
+
 # ==========================================
 # 4. COMPREHENSIVE DECK DISPLAY & BUILDER
 # ==========================================
@@ -1199,13 +1541,13 @@ def render_deck_display(deck_id, deck_name):
     # ---------------------------------------------------------
     col_cz_title, col_cz_dup = st.columns([3, 1])
     with col_cz_title:
-        st.markdown("### 👑 Command Zone")
+        st.markdown("### Command Zone")
     with col_cz_dup:
-        with st.popover("📋 Duplicate (Test Branch)", use_container_width=True):
-            st.markdown("#### 🧪 Clone Deck for Testing")
+        with st.popover("Duplicate (Test Branch)", use_container_width=True):
+            st.markdown("#### Clone Deck for Testing")
             st.caption("Create a testing branch to safely experiment with land balances, AI card swaps, or cuts without altering your primary deck.")
             quick_dup_val = st.text_input("Branch Name", value=f"{deck_name} (Test Branch)", key=f"top_dup_{deck_id}")
-            if st.button("🚀 Create Branch & Switch", key=f"btn_top_dup_{deck_id}", type="primary", use_container_width=True):
+            if st.button("Create Branch & Switch", key=f"btn_top_dup_{deck_id}", type="primary", use_container_width=True):
                 if quick_dup_val.strip():
                     new_b_name = quick_dup_val.strip()
                     execute_db("INSERT INTO decks (name, commander, partner_commander) VALUES (?, ?, ?)",
@@ -1233,11 +1575,11 @@ def render_deck_display(deck_id, deck_name):
                     st.image(c_disp["image_url"], use_container_width=True)
                     if c_has_faces:
                         other_face_name = c_faces[1 - c_idx]["name"]
-                        if st.button(f"🔄 Flip ({other_face_name})", key=f"btn_flip_cmdr_{deck_id}", use_container_width=True):
+                        if st.button(f"Flip ({other_face_name})", key=f"btn_flip_cmdr_{deck_id}", use_container_width=True):
                             toggle_card_face(current_commander, scope=f"cmdr_{deck_id}")
                             st.rerun()
                 with sub2:
-                    st.markdown(f"#### 👑 **{c_disp['name']}**")
+                    st.markdown(f"#### **{c_disp['name']}**")
                     cost_str = c_disp['mana_cost']
                     type_str = c_disp['type_line']
                     cmc_num = c_disp.get('cmc', 0)
@@ -1246,35 +1588,28 @@ def render_deck_display(deck_id, deck_name):
                     st.caption(f"Colors: {c_emojis}")
                     cmdr_kw = c_disp.get('keywords', '')
                     if cmdr_kw and str(cmdr_kw).strip():
-                        st.caption(f"🏷️ `{cmdr_kw}`")
+                        st.caption(f"`{cmdr_kw}`")
                     if c_disp['oracle_text']:
-                        with st.expander(f"📜 Text ({c_disp['name']})"):
+                        with st.expander(f"Text ({c_disp['name']})"):
                             st.markdown(f"> *{str(c_disp['oracle_text']).replace(chr(10), '<br>') }*", unsafe_allow_html=True)
-                    with st.popover("⚙️ Modify Commander"):
+                    with st.popover("Modify Commander"):
                         st.markdown("**Choose New Commander**")
-                        leg_df = run_query("SELECT card_name FROM collection WHERE (type_line LIKE '%Legendary%Creature%' OR type_line LIKE '%Planeswalker%') ORDER BY card_name ASC")
-                        leg_opts = ["-- Select from Collection --"] + (leg_df['card_name'].tolist() if not leg_df.empty else [])
-                        ch_leg = st.selectbox("From Collection", leg_opts, key=f"ch_leg_{deck_id}")
-                        ch_custom = st.text_input("Or enter Card Name", placeholder="e.g. Atraxa", key=f"ch_custom_{deck_id}")
-                        if st.button("Update Commander", key=f"btn_upd_cmdr_{deck_id}"):
-                            picked = ch_custom.strip() if ch_custom.strip() else (ch_leg if ch_leg != "-- Select from Collection --" else "")
+                        picked = render_cmdr_picker_inputs(deck_id, df_deck, key_prefix=f"mod_c1_{deck_id}")
+                        if st.button("Update Commander", key=f"btn_upd_p_cmdr_{deck_id}"):
                             if picked:
-                                scry = fetch_scryfall_data(picked)
+                                scry = set_deck_commander(deck_id, picked)
                                 if scry:
-                                    execute_db("UPDATE decks SET commander = ? WHERE id = ?", (scry['name'], deck_id))
-                                    add_card_to_deck(deck_id, scry['name'], 1)
-                                    add_card_to_collection(scry['name'], 1)
-                                    st.success(f"Commander updated to {scry['name']}!")
+                                    st.success(f"Commander updated to **{scry['name']}**!")
                                     st.rerun()
                                 else:
                                     st.error("Card not found on Scryfall.")
-                        if st.button("Remove Commander", key=f"btn_clear_cmdr_{deck_id}"):
+                        if st.button("Remove Commander", key=f"btn_clear_p_cmdr_{deck_id}"):
                             execute_db("UPDATE decks SET commander = NULL WHERE id = ?", (deck_id,))
                             st.rerun()
 
             # Slot 2: Secondary Commander (Partner or Background with flip support)
             with c_col2:
-                badge_title = "🏰 Background" if partner_type == "background" else "🤝 Partner Commander"
+                badge_title = "Background" if partner_type == "background" else "Partner Commander"
                 if current_partner:
                     p_idx, p_disp, p_has_faces, p_faces = get_card_display_details(current_partner, partner_data, scope=f"partner_{deck_id}")
                     psub1, psub2 = st.columns([1, 2])
@@ -1282,7 +1617,7 @@ def render_deck_display(deck_id, deck_name):
                         st.image(p_disp["image_url"], use_container_width=True)
                         if p_has_faces:
                             other_p_name = p_faces[1 - p_idx]["name"]
-                            if st.button(f"🔄 Flip ({other_p_name})", key=f"btn_flip_part_{deck_id}", use_container_width=True):
+                            if st.button(f"Flip ({other_p_name})", key=f"btn_flip_part_{deck_id}", use_container_width=True):
                                 toggle_card_face(current_partner, scope=f"partner_{deck_id}")
                                 st.rerun()
                     with psub2:
@@ -1294,29 +1629,20 @@ def render_deck_display(deck_id, deck_name):
                         st.caption(f"Colors: {p_emojis}")
                         p_kw = p_disp.get('keywords', '')
                         if p_kw and str(p_kw).strip():
-                            st.caption(f"🏷️ `{p_kw}`")
+                            st.caption(f"`{p_kw}`")
                         if p_disp['oracle_text']:
-                            with st.expander(f"📜 Text ({p_disp['name']})"):
+                            with st.expander(f"Text ({p_disp['name']})"):
                                 st.markdown(f"> *{str(p_disp['oracle_text']).replace(chr(10), '<br>') }*", unsafe_allow_html=True)
-                        with st.popover(f"⚙️ Modify {badge_title}"):
+                        with st.popover(f"Modify {badge_title}"):
                             st.markdown(f"**Choose New {badge_title}**")
-                            if partner_type == "background":
-                                p_df = run_query("SELECT card_name FROM collection WHERE type_line LIKE '%Background%' ORDER BY card_name ASC")
-                            else:
-                                p_df = run_query("SELECT card_name FROM collection WHERE (type_line LIKE '%Legendary%' OR type_line LIKE '%Planeswalker%') ORDER BY card_name ASC")
-                            p_opts = ["-- Select from Collection --"] + (p_df['card_name'].tolist() if not p_df.empty else [])
-                            ch_p_leg = st.selectbox(f"From Collection", p_opts, key=f"ch_p_leg_{deck_id}")
-                            ch_p_custom = st.text_input("Or enter Card Name", placeholder="Card name", key=f"ch_p_custom_{deck_id}")
+                            p_picked = render_cmdr_picker_inputs(deck_id, df_deck, key_prefix=f"mod_p_{deck_id}")
                             if st.button(f"Update {badge_title}", key=f"btn_upd_partner_{deck_id}"):
-                                p_picked = ch_p_custom.strip() if ch_p_custom.strip() else (ch_p_leg if ch_p_leg != "-- Select from Collection --" else "")
                                 if p_picked:
-                                    s_p = fetch_scryfall_data(p_picked)
-                                    if s_p:
+                                    if current_partner:
                                         remove_card_from_deck(deck_id, current_partner, remove_all=True)
-                                        execute_db("UPDATE decks SET partner_commander = ? WHERE id = ?", (s_p['name'], deck_id))
-                                        add_card_to_deck(deck_id, s_p['name'], 1)
-                                        add_card_to_collection(s_p['name'], 1)
-                                        st.success(f"{badge_title} updated to {s_p['name']}!")
+                                    s_p = set_deck_commander(deck_id, p_picked, is_partner=True)
+                                    if s_p:
+                                        st.success(f"{badge_title} updated to **{s_p['name']}**!")
                                         st.rerun()
                                     else:
                                         st.error("Card not found on Scryfall.")
@@ -1328,39 +1654,25 @@ def render_deck_display(deck_id, deck_name):
                     # Partner / Background keyword present on commander, but no partner assigned yet
                     with st.container(border=True):
                         if partner_type == "background":
-                            st.markdown("#### 🏰 Choose a Background")
+                            st.markdown("#### Choose a Background")
                             st.caption(f"**{current_commander}** has *Choose a Background*! Add a Legendary Background Enchantment as a second commander.")
-                            bg_df = run_query("SELECT card_name FROM collection WHERE type_line LIKE '%Background%' ORDER BY card_name ASC")
-                            bg_opts = ["-- Select Background from Binder --"] + (bg_df['card_name'].tolist() if not bg_df.empty else [])
-                            ch_bg = st.selectbox("From Collection", bg_opts, key=f"sel_bg_{deck_id}")
-                            ch_bg_name = st.text_input("Or enter Background Name", placeholder="e.g. Raised by Giants", key=f"txt_bg_{deck_id}")
+                            picked_bg = render_cmdr_picker_inputs(deck_id, df_deck, key_prefix=f"init_bg_{deck_id}")
                             if st.button("Set Background", key=f"btn_set_bg_{deck_id}"):
-                                picked_bg = ch_bg_name.strip() if ch_bg_name.strip() else (ch_bg if ch_bg != "-- Select Background from Binder --" else "")
                                 if picked_bg:
-                                    sc_bg = fetch_scryfall_data(picked_bg)
+                                    sc_bg = set_deck_commander(deck_id, picked_bg, is_partner=True)
                                     if sc_bg:
-                                        execute_db("UPDATE decks SET partner_commander = ? WHERE id = ?", (sc_bg['name'], deck_id))
-                                        add_card_to_deck(deck_id, sc_bg['name'], 1)
-                                        add_card_to_collection(sc_bg['name'], 1)
                                         st.success(f"Background set to **{sc_bg['name']}**!")
                                         st.rerun()
                                     else:
                                         st.error("Card not found on Scryfall. Check spelling!")
                         else:
-                            st.markdown("#### 🤝 Choose a Partner")
+                            st.markdown("#### Choose a Partner")
                             st.caption(f"**{current_commander}** has *Partner*! You may choose a second partner commander.")
-                            part_df = run_query("SELECT card_name FROM collection WHERE (type_line LIKE '%Legendary%' OR type_line LIKE '%Planeswalker%') AND (keywords LIKE '%Partner%' OR oracle_text LIKE '%Partner%' OR keywords LIKE '%Friends forever%' OR oracle_text LIKE '%Friends forever%' OR keywords LIKE '%Doctor%') ORDER BY card_name ASC")
-                            part_opts = ["-- Select Partner from Binder --"] + (part_df['card_name'].tolist() if not part_df.empty else [])
-                            ch_pr = st.selectbox("From Collection", part_opts, key=f"sel_pr_{deck_id}")
-                            ch_pr_name = st.text_input("Or enter Partner Name", placeholder="e.g. Thrasios, Triton Hero", key=f"txt_pr_{deck_id}")
+                            picked_pr = render_cmdr_picker_inputs(deck_id, df_deck, key_prefix=f"init_pr_{deck_id}")
                             if st.button("Set Partner Commander", key=f"btn_set_pr_{deck_id}"):
-                                picked_pr = ch_pr_name.strip() if ch_pr_name.strip() else (ch_pr if ch_pr != "-- Select Partner from Binder --" else "")
                                 if picked_pr:
-                                    sc_pr = fetch_scryfall_data(picked_pr)
+                                    sc_pr = set_deck_commander(deck_id, picked_pr, is_partner=True)
                                     if sc_pr:
-                                        execute_db("UPDATE decks SET partner_commander = ? WHERE id = ?", (sc_pr['name'], deck_id))
-                                        add_card_to_deck(deck_id, sc_pr['name'], 1)
-                                        add_card_to_collection(sc_pr['name'], 1)
                                         st.success(f"Partner commander set to **{sc_pr['name']}**!")
                                         st.rerun()
                                     else:
@@ -1373,11 +1685,11 @@ def render_deck_display(deck_id, deck_name):
                 st.image(c_disp["image_url"], width=130)
                 if c_has_faces:
                     other_face_name = c_faces[1 - c_idx]["name"]
-                    if st.button(f"🔄 Flip ({other_face_name})", key=f"btn_flip_single_cmdr_{deck_id}"):
+                    if st.button(f"Flip ({other_face_name})", key=f"btn_flip_single_cmdr_{deck_id}"):
                         toggle_card_face(current_commander, scope=f"cmdr_{deck_id}")
                         st.rerun()
             with c_info:
-                st.markdown(f"### 👑 Commander: **{c_disp['name']}**")
+                st.markdown(f"### Commander: **{c_disp['name']}**")
                 cost_str = c_disp['mana_cost']
                 type_str = c_disp['type_line']
                 cmc_num = c_disp.get('cmc', 0)
@@ -1386,24 +1698,17 @@ def render_deck_display(deck_id, deck_name):
                 if cmdr_kw and str(cmdr_kw).strip():
                     st.markdown(f"**Keywords:** `{cmdr_kw}`")
                 if c_disp['oracle_text']:
-                    with st.expander(f"📜 Rules Text ({c_disp['name']})"):
+                    with st.expander(f"Rules Text ({c_disp['name']})"):
                         st.markdown(f"> *{str(c_disp['oracle_text']).replace(chr(10), '<br>') }*", unsafe_allow_html=True)
             with c_action:
-                with st.popover("👑 Change Commander"):
+                with st.popover("Change Commander"):
                     st.markdown("**Select New Commander**")
-                    leg_df = run_query("SELECT card_name FROM collection WHERE (type_line LIKE '%Legendary%Creature%' OR type_line LIKE '%Planeswalker%') ORDER BY card_name ASC")
-                    leg_opts = ["-- Select from Collection --"] + (leg_df['card_name'].tolist() if not leg_df.empty else [])
-                    ch_leg = st.selectbox("From Collection", leg_opts, key=f"ch_leg_{deck_id}")
-                    ch_custom = st.text_input("Or enter Card Name", placeholder="e.g. Atraxa", key=f"ch_custom_{deck_id}")
+                    picked = render_cmdr_picker_inputs(deck_id, df_deck, key_prefix=f"chg_single_{deck_id}")
                     if st.button("Update Commander", key=f"btn_upd_cmdr_{deck_id}"):
-                        picked = ch_custom.strip() if ch_custom.strip() else (ch_leg if ch_leg != "-- Select from Collection --" else "")
                         if picked:
-                            scry = fetch_scryfall_data(picked)
+                            scry = set_deck_commander(deck_id, picked)
                             if scry:
-                                execute_db("UPDATE decks SET commander = ? WHERE id = ?", (scry['name'], deck_id))
-                                add_card_to_deck(deck_id, scry['name'], 1)
-                                add_card_to_collection(scry['name'], 1)
-                                st.success(f"Commander updated to {scry['name']}!")
+                                st.success(f"Commander updated to **{scry['name']}**!")
                                 st.rerun()
                             else:
                                 st.error("Card not found on Scryfall.")
@@ -1413,7 +1718,7 @@ def render_deck_display(deck_id, deck_name):
 
             # If deck previously had a partner but commander was changed to someone without partner/background
             if current_partner:
-                st.warning(f"⚠️ **Note:** {current_commander} does not have the Partner or Background keyword, but **{current_partner}** is set as a partner.")
+                st.warning(f"**Note:** {current_commander} does not have the Partner or Background keyword, but **{current_partner}** is set as a partner.")
                 if st.button("Remove Inactive Partner Card", key=f"purge_incompat_part_{deck_id}"):
                     remove_card_from_deck(deck_id, current_partner, remove_all=True)
                     execute_db("UPDATE decks SET partner_commander = NULL WHERE id = ?", (deck_id,))
@@ -1422,25 +1727,15 @@ def render_deck_display(deck_id, deck_name):
         # Color identity summary
         ci_str = " ".join([COLOR_EMOJI_MAP.get(c, c) for c in sorted(combined_ci)]) if combined_ci else "🔘 Colorless"
         ci_letters = ", ".join(sorted(combined_ci)) if combined_ci else "Colorless"
-        st.caption(f"🛡️ **Combined Color Identity:** {ci_str} `[{ci_letters}]` — cards added from your collection must match this identity.")
+        st.caption(f"**Combined Color Identity:** {ci_str} `[{ci_letters}]` — cards added from your collection must match this identity.")
     else:
-        st.warning("⚠️ **No Commander Assigned Yet!** Choose a Commander below to establish this deck's legal Color Identity.")
-        with st.expander("👑 Choose Commander for this Deck", expanded=(total_cards == 0)):
-            leg_df = run_query("SELECT card_name FROM collection WHERE (type_line LIKE '%Legendary%Creature%' OR type_line LIKE '%Planeswalker%') ORDER BY card_name ASC")
-            leg_opts = ["-- Select from Collection --"] + (leg_df['card_name'].tolist() if not leg_df.empty else [])
-            col_c1, col_c2 = st.columns(2)
-            with col_c1:
-                ch_leg = st.selectbox("From Collection", leg_opts, key=f"init_leg_{deck_id}")
-            with col_c2:
-                ch_custom = st.text_input("Or enter Commander Name", placeholder="e.g. Atraxa, Praetors' Voice", key=f"init_custom_{deck_id}")
+        st.warning("**No Commander Assigned Yet!** Choose a Commander below to establish this deck's legal Color Identity.")
+        with st.expander("Choose Commander for this Deck", expanded=(total_cards == 0)):
+            picked = render_cmdr_picker_inputs(deck_id, df_deck, key_prefix=f"init_cmdr_{deck_id}")
             if st.button("Set Commander", key=f"btn_set_cmdr_{deck_id}"):
-                picked = ch_custom.strip() if ch_custom.strip() else (ch_leg if ch_leg != "-- Select from Collection --" else "")
                 if picked:
-                    scry = fetch_scryfall_data(picked)
+                    scry = set_deck_commander(deck_id, picked)
                     if scry:
-                        execute_db("UPDATE decks SET commander = ? WHERE id = ?", (scry['name'], deck_id))
-                        add_card_to_deck(deck_id, scry['name'], 1)
-                        add_card_to_collection(scry['name'], 1)
                         st.success(f"Commander set to **{scry['name']}**!")
                         st.rerun()
                     else:
@@ -1450,23 +1745,23 @@ def render_deck_display(deck_id, deck_name):
     # METRICS BAR & 100-CARD PROGRESS
     # ---------------------------------------------------------
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("🃏 Total Cards", f"{total_cards} / 100")
-    m2.metric("🗃️ Unique Titles", f"{unique_cards}")
-    m3.metric("⚡ Avg Mana Value", f"{avg_cmc:.2f}")
-    m4.metric("🏔️ Lands / Spells", f"{total_lands} / {total_non_land}")
+    m1.metric("Total Cards", f"{total_cards} / 100")
+    m2.metric("Unique Titles", f"{unique_cards}")
+    m3.metric("Avg Mana Value", f"{avg_cmc:.2f}")
+    m4.metric("Lands / Spells", f"{total_lands} / {total_non_land}")
     if combined_ci is not None:
         ci_display = " ".join([COLOR_EMOJI_MAP.get(c, c) for c in sorted(combined_ci)]) if combined_ci else "🔘 Colorless"
     else:
-        ci_display = "⚠️ Not Set"
-    m5.metric("🎨 Identity", ci_display)
+        ci_display = "Not Set"
+    m5.metric("Identity", ci_display)
 
     progress_val = min(1.0, max(0.0, total_cards / 100.0))
     if total_cards == 100:
-        st.progress(progress_val, text="✅ Perfect 100-Card Commander Deck")
+        st.progress(progress_val, text="Perfect 100-Card Commander Deck")
     elif total_cards < 100:
-        st.progress(progress_val, text=f"⏳ {total_cards}/100 Cards ({100 - total_cards} slots remaining)")
+        st.progress(progress_val, text=f"{total_cards}/100 Cards ({100 - total_cards} slots remaining)")
     else:
-        st.progress(1.0, text=f"⚠️ {total_cards}/100 Cards ({total_cards - 100} cards over the 100-card limit)")
+        st.progress(1.0, text=f"{total_cards}/100 Cards ({total_cards - 100} cards over the 100-card limit)")
 
     st.markdown("---")
 
@@ -1488,7 +1783,7 @@ def render_deck_display(deck_id, deck_name):
     # -------------------------
     with tab_add:
         # Quick Add Basic Lands feature
-        with st.expander("🏔️ Quick Add Basic Lands (Auto-Stocks Binder)", expanded=False):
+        with st.expander("Quick Add Basic Lands (Auto-Stocks Binder)", expanded=False):
             st.caption("Quickly add basic lands to your deck. If you don't have enough physical copies in your binder, they will be automatically added to your binder.")
             allowed_basics = []
             if combined_ci is not None:
@@ -1506,17 +1801,17 @@ def render_deck_display(deck_id, deck_name):
                 basic_qty = st.number_input("Count", min_value=1, max_value=99, value=1, step=1, key=f"quick_basic_qty_{deck_id}")
             with col_bl3:
                 st.write("")
-                if st.button("➕ Add Lands to Deck", key=f"quick_basic_btn_{deck_id}", use_container_width=True):
+                if st.button("Add Lands to Deck", key=f"quick_basic_btn_{deck_id}", use_container_width=True):
                     res_avail = run_query("SELECT quantity_available FROM v_available_cards WHERE card_name = ?", (chosen_basic,))
                     curr_avail = int(res_avail.iloc[0]['quantity_available']) if not res_avail.empty else 0
                     needed = basic_qty - curr_avail
                     if needed > 0:
                         add_card_to_collection(chosen_basic, needed)
                     add_card_to_deck(deck_id, chosen_basic, basic_qty)
-                    st.toast(f"Added {basic_qty}x {chosen_basic} to deck!", icon="🏔️")
+                    st.toast(f"Added {basic_qty}x {chosen_basic} to deck!")
                     st.rerun()
 
-        st.subheader("➕ Add Cards to Deck from Collection")
+        st.subheader("Add Cards to Deck from Collection")
 
         df_col = run_query("""
             SELECT 
@@ -1537,32 +1832,40 @@ def render_deck_display(deck_id, deck_name):
         """)
 
         if df_col.empty:
-            st.info("Your collection binder is empty! Add cards to your binder in **📚 My Binder** first.")
+            st.info("Your collection binder is empty! Add cards to your binder in **My Binder** first.")
         else:
             if combined_ci is not None:
                 df_legal = df_col[df_col.apply(
                     lambda r: is_card_legal_for_commander(r['card_name'], r['color_identity'], combined_ci),
                     axis=1
                 )].copy()
-                st.caption(f"🛡️ Showing **{len(df_legal)}** collection cards matching the deck's color identity ({', '.join(sorted(combined_ci)) if combined_ci else 'Colorless'}).")
+                st.caption(f"Showing **{len(df_legal)}** collection cards matching the deck's color identity ({', '.join(sorted(combined_ci)) if combined_ci else 'Colorless'}).")
             else:
                 df_legal = df_col.copy()
-                st.warning("⚠️ No Commander assigned! Assign a Commander above to filter by legal color identity.")
+                st.warning("No Commander assigned! Assign a Commander above to filter by legal color identity.")
 
             if df_legal.empty:
-                st.warning("No cards in your collection match this deck's color identity. Add matching cards in **📚 My Binder**!")
+                st.warning("No cards in your collection match this deck's color identity. Add matching cards in **My Binder**!")
             else:
-                col_search_txt, col_type_sel, col_avail_chk, col_grid_cols = st.columns([3, 2, 2, 1])
+                col_search_txt, col_type_sel, col_avail_chk, col_hide_deck, col_grid_cols = st.columns([3, 2, 2, 2, 1])
                 with col_search_txt:
-                    s_term = st.text_input("🔍 Search Collection (Name, Text, Keyword)", placeholder="e.g. Sol Ring, Flying, Draw...", key=f"col_search_{deck_id}")
+                    s_term = st.text_input("Search Collection (Name, Text, Keyword)", placeholder="e.g. Sol Ring, Flying, Draw...", key=f"col_search_{deck_id}")
                 with col_type_sel:
                     t_choice = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key=f"col_cat_{deck_id}")
                 with col_avail_chk:
                     only_avail = st.checkbox("Only unassigned (>0)", value=False, key=f"only_free_{deck_id}", help="Only show cards that currently have copies available in binder")
+                with col_hide_deck:
+                    hide_in_deck = st.checkbox("Hide cards in deck", value=True, key=f"hide_deck_cards_{deck_id}", help="Do not show cards that are already in this deck")
                 with col_grid_cols:
                     grid_cols_num = st.selectbox("Cards/Row", [3, 4, 5, 6], index=1, key=f"col_grid_n_{deck_id}")
 
                 filtered_legal = df_legal.copy()
+                cards_already_in_deck = set(df_deck['card_name'].tolist()) if not df_deck.empty else set()
+                if hide_in_deck:
+                    filtered_legal = filtered_legal[
+                        (~filtered_legal['card_name'].isin(cards_already_in_deck)) |
+                        (filtered_legal['card_name'].str.lower().isin(BASIC_LANDS))
+                    ]
                 if s_term:
                     term_lower = s_term.lower().strip()
                     filtered_legal = filtered_legal[
@@ -1640,29 +1943,29 @@ def render_deck_display(deck_id, deck_name):
 
                                     # Availability Badge
                                     if free_qty > 0:
-                                        st.caption(f"🟢 **{free_qty}** free / {total_qty} owned")
+                                        st.caption(f"✅ **{free_qty}** free / {total_qty} owned")
                                     else:
-                                        st.caption(f"🔴 **0** free / {total_qty} owned")
+                                        st.caption(f"❌ **0** free / {total_qty} owned")
 
                                     # Deck presence alert
                                     if already_in_deck > 0:
                                         if is_basic:
-                                            st.caption(f"🏔️ **{already_in_deck}** in this deck")
+                                            st.caption(f"In this deck: **{already_in_deck}**")
                                         else:
-                                            st.caption(f"⚠️ **{already_in_deck}** in deck (Singleton)")
+                                            st.caption(f"In deck: **{already_in_deck}** (Singleton)")
 
                                     # Card tools row (Flip, Oracle Text popover, Scryfall link)
                                     c_tool1, c_tool2, c_tool3 = st.columns([1, 1, 1])
                                     with c_tool1:
                                         if has_faces:
                                             other_face_title = faces[1 - f_idx]["name"]
-                                            if st.button("🔄", key=f"g_flip_{deck_id}_{c_name}", help=f"Flip: {other_face_title}"):
+                                            if st.button("Flip", key=f"g_flip_{deck_id}_{c_name}", help=f"Flip: {other_face_title}"):
                                                 toggle_card_face(c_name, scope=f"add_{deck_id}")
                                                 st.rerun()
                                         else:
                                             st.write("")
                                     with c_tool2:
-                                        with st.popover("📜", help="Rules Text & Keywords"):
+                                        with st.popover("Text", help="Rules Text & Keywords"):
                                             st.markdown(f"**{card_disp['name']}**")
                                             st.caption(f"{cost_lbl} • {card_disp['type_line']}")
                                             kw_info = card_disp.get('keywords', '')
@@ -1684,17 +1987,17 @@ def render_deck_display(deck_id, deck_name):
                                         with col_bq:
                                             b_qty_in = st.number_input("Qty", min_value=1, max_value=99, value=1, step=1, key=f"g_bqty_{deck_id}_{c_name}", label_visibility="collapsed")
                                         with col_ba:
-                                            if st.button("➕ Add", key=f"g_add_{deck_id}_{c_name}", use_container_width=True):
+                                            if st.button("Add", key=f"g_add_basic_{deck_id}_{c_name}", use_container_width=True):
                                                 add_card_to_deck(deck_id, c_name, b_qty_in)
-                                                st.toast(f"Added {b_qty_in}x {c_name} to deck!", icon="🏔️")
+                                                st.toast(f"Added {b_qty_in}x {c_name} to deck!")
                                                 st.rerun()
                                     else:
-                                        if st.button("➕ Add to Deck", key=f"g_add_{deck_id}_{c_name}", use_container_width=True):
+                                        if st.button("Add to Deck", key=f"g_add_{deck_id}_{c_name}", use_container_width=True):
                                             add_card_to_deck(deck_id, c_name, 1)
                                             if free_qty <= 0:
-                                                st.toast(f"Added {c_name} (⚠️ 0 free in binder)", icon="⚠️")
+                                                st.toast(f"Added {c_name} (0 free in binder)")
                                             else:
-                                                st.toast(f"Added {c_name} to deck!", icon="✅")
+                                                st.toast(f"Added {c_name} to deck!")
                                             st.rerun()
 
                     # Bottom pagination controls if multi-page
@@ -1715,7 +2018,7 @@ def render_deck_display(deck_id, deck_name):
         # Cards currently in deck section with quick remove
         if not df_deck.empty:
             st.divider()
-            st.subheader(f"📋 Cards Currently in this Deck ({total_cards} Total)")
+            st.subheader(f"Cards Currently in this Deck ({total_cards} Total)")
             for _, r in df_deck.iterrows():
                 c_q, c_n, c_t, c_cost, c_act1, c_act2 = st.columns([1, 4, 3, 2, 1, 1])
                 with c_q:
@@ -1729,14 +2032,14 @@ def render_deck_display(deck_id, deck_name):
                     cost_str = r['mana_cost'] if r['mana_cost'] else f"CMC {r['cmc']:g}"
                     st.caption(cost_str)
                 with c_act1:
-                    if st.button("➖ 1", key=f"qm_sub_{deck_id}_{r['card_name']}", help="Remove 1 copy and return to collection"):
+                    if st.button("-1", key=f"qm_sub_{deck_id}_{r['card_name']}", help="Remove 1 copy and return to collection"):
                         remove_card_from_deck(deck_id, r['card_name'], remove_all=False)
-                        st.toast(f"Removed 1x {r['card_name']} — returned to collection!", icon="↩️")
+                        st.toast(f"Removed 1x {r['card_name']} — returned to collection!")
                         st.rerun()
                 with c_act2:
                     if st.button("🗑️", key=f"qm_del_{deck_id}_{r['card_name']}", help="Remove all copies and return to collection"):
                         remove_card_from_deck(deck_id, r['card_name'], remove_all=True)
-                        st.toast(f"Removed {r['card_name']} — returned to collection!", icon="↩️")
+                        st.toast(f"Removed {r['card_name']} — returned to collection!")
                         st.rerun()
 
     # -------------------------
@@ -1744,7 +2047,7 @@ def render_deck_display(deck_id, deck_name):
     # -------------------------
     with tab_visual:
         if df_deck.empty:
-            st.info("No cards in this deck yet! Use the '➕ Add Cards from Collection' tab above to add cards.")
+            st.info("No cards in this deck yet! Use the 'Add Cards from Collection' tab above to add cards.")
         else:
             col_f1, col_f2, col_f3, col_f4 = st.columns([2, 2, 1, 1])
             with col_f1:
@@ -1771,83 +2074,92 @@ def render_deck_display(deck_id, deck_name):
             else:
                 def render_gallery_card_col(row, col_container):
                     with col_container:
-                        f_idx, disp, has_faces, faces = get_card_display_details(row['card_name'], row, scope=f"vis_{deck_id}")
-                        try:
-                            st.image(disp["image_url"], use_container_width=True)
-                        except Exception:
-                            st.caption("Image not available")
+                        with st.container(border=True):
+                            f_idx, disp, has_faces, faces = get_card_display_details(row['card_name'], row, scope=f"vis_{deck_id}")
+                            try:
+                                st.image(disp["image_url"], use_container_width=True)
+                            except Exception:
+                                st.caption("Image not available")
 
-                        st.markdown(f"**{row['quantity']}x {disp['name']}**")
-                        cost_label = disp['mana_cost'] if disp['mana_cost'] else f"CMC {disp['cmc']:g}"
-                        st.caption(f"{cost_label} • {disp['type_line']}")
+                            st.markdown(f"**{row['quantity']}x {disp['name']}**")
+                            cost_label = disp['mana_cost'] if disp['mana_cost'] else f"CMC {disp['cmc']:g}"
+                            st.caption(f"{cost_label} • {disp['type_line']}")
 
-                        if disp.get('power') and disp.get('toughness'):
-                            st.caption(f"⚔️ {disp['power']}/{disp['toughness']}")
+                            if disp.get('power') and disp.get('toughness'):
+                                st.markdown(f"<div style='min-height:20px; font-size:0.85rem; font-weight:600;'>{disp['power']}/{disp['toughness']}</div>", unsafe_allow_html=True)
+                            else:
+                                st.markdown("<div style='min-height:20px;'></div>", unsafe_allow_html=True)
 
-                        kw_val = disp.get('keywords', '')
-                        if kw_val and pd.notna(kw_val) and str(kw_val).strip():
-                            kw_badges = " ".join([f"`{k.strip()}`" for k in str(kw_val).split(",") if k.strip()][:3])
-                            st.caption(f"🏷️ {kw_badges}")
+                            kw_val = disp.get('keywords', '')
+                            if kw_val and pd.notna(kw_val) and str(kw_val).strip():
+                                kw_badges = " ".join([f"`{k.strip()}`" for k in str(kw_val).split(",") if k.strip()][:3])
+                                st.markdown(f"<div style='min-height:24px; font-size:0.75rem; color:#888; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;'>{kw_badges}</div>", unsafe_allow_html=True)
+                            else:
+                                st.markdown("<div style='min-height:24px;'></div>", unsafe_allow_html=True)
 
-                        # Action bar with flip button for double-faced cards
-                        if has_faces:
-                            col_r1, col_flip, col_r2, col_r3 = st.columns([1, 1, 1, 1])
-                            with col_flip:
-                                other_face_n = faces[1 - f_idx]["name"]
-                                if st.button("🔄", key=f"vis_flip_{deck_id}_{row['card_name']}", help=f"Flip to other face: {other_face_n}"):
-                                    toggle_card_face(row['card_name'], scope=f"vis_{deck_id}")
+                            # Action bar with flip button for double-faced cards
+                            if has_faces:
+                                col_r1, col_flip, col_r2, col_r3 = st.columns([1, 1, 1, 1])
+                                with col_flip:
+                                    other_face_n = faces[1 - f_idx]["name"]
+                                    if st.button("Flip", key=f"vis_flip_{deck_id}_{row['card_name']}", help=f"Flip to other face: {other_face_n}"):
+                                        toggle_card_face(row['card_name'], scope=f"vis_{deck_id}")
+                                        st.rerun()
+                            else:
+                                col_r1, col_r2, col_r3 = st.columns([1, 1, 1])
+
+                            with col_r1:
+                                if st.button("-1", key=f"vis_rm_{deck_id}_{row['card_name']}", help="Remove copy"):
+                                    remove_card_from_deck(deck_id, row['card_name'], remove_all=False)
+                                    st.toast(f"Removed {row['card_name']} — returned to collection!")
                                     st.rerun()
-                        else:
-                            col_r1, col_r2, col_r3 = st.columns([1, 1, 1])
-
-                        with col_r1:
-                            if st.button("➖", key=f"vis_rm_{deck_id}_{row['card_name']}", help="Remove copy"):
-                                remove_card_from_deck(deck_id, row['card_name'], remove_all=False)
-                                st.toast(f"Removed {row['card_name']} — returned to collection!", icon="↩️")
-                                st.rerun()
-                        with col_r2:
-                            with st.popover("📜", use_container_width=True):
-                                st.markdown(f"**{disp['name']}**")
-                                st.caption(f"{cost_label} • {disp['type_line']}")
-                                if kw_val and pd.notna(kw_val) and str(kw_val).strip():
-                                    st.markdown(f"**Keywords:** {kw_val}")
-                                if disp.get('oracle_text') and str(disp['oracle_text']).strip():
-                                    st.markdown(f"> *{str(disp['oracle_text']).replace(chr(10), '<br>') }*", unsafe_allow_html=True)
-                                else:
-                                    st.caption("No oracle text on this face.")
-                                if has_faces:
-                                    st.divider()
-                                    st.caption(f"Showing Face {f_idx + 1} of 2 ({disp['name']})")
-                        with col_r3:
-                            scryfall_url = f"https://scryfall.com/search?q=%21%22{requests.utils.quote(row['card_name'])}%22"
-                            st.markdown(f"[↗ Scryfall]({scryfall_url})")
+                            with col_r2:
+                                with st.popover("Text", use_container_width=True):
+                                    st.markdown(f"**{disp['name']}**")
+                                    st.caption(f"{cost_label} • {disp['type_line']}")
+                                    if kw_val and pd.notna(kw_val) and str(kw_val).strip():
+                                        st.markdown(f"**Keywords:** {kw_val}")
+                                    if disp.get('oracle_text') and str(disp['oracle_text']).strip():
+                                        st.markdown(f"> *{str(disp['oracle_text']).replace(chr(10), '<br>') }*", unsafe_allow_html=True)
+                                    else:
+                                        st.caption("No oracle text on this face.")
+                                    if has_faces:
+                                        st.divider()
+                                        st.caption(f"Showing Face {f_idx + 1} of 2 ({disp['name']})")
+                            with col_r3:
+                                scryfall_url = f"https://scryfall.com/search?q=%21%22{requests.utils.quote(row['card_name'])}%22"
+                                st.markdown(f"[↗ Scryfall]({scryfall_url})")
 
                 if group_sections and cat_filter == "All Categories":
                     for cat_name, cat_emoji in CATEGORY_ORDER:
                         cat_group = filtered_cards[filtered_cards['category'] == cat_name]
                         if not cat_group.empty:
                             cat_total_qty = int(cat_group['quantity'].sum())
-                            st.markdown(f"#### {cat_emoji} {cat_name} ({cat_total_qty})")
-                            cols = st.columns(grid_cols)
-                            for idx, (_, row) in enumerate(cat_group.iterrows()):
-                                render_gallery_card_col(row, cols[idx % grid_cols])
+                            st.markdown(f"#### {cat_name} ({cat_total_qty})")
+                            grid_rows = [cat_group.iloc[i:i + grid_cols] for i in range(0, len(cat_group), grid_cols)]
+                            for r_df in grid_rows:
+                                cols = st.columns(grid_cols)
+                                for idx, (_, row) in enumerate(r_df.iterrows()):
+                                    render_gallery_card_col(row, cols[idx])
                 else:
-                    cols = st.columns(grid_cols)
-                    for idx, (_, row) in enumerate(filtered_cards.iterrows()):
-                        render_gallery_card_col(row, cols[idx % grid_cols])
+                    grid_rows = [filtered_cards.iloc[i:i + grid_cols] for i in range(0, len(filtered_cards), grid_cols)]
+                    for r_df in grid_rows:
+                        cols = st.columns(grid_cols)
+                        for idx, (_, row) in enumerate(r_df.iterrows()):
+                            render_gallery_card_col(row, cols[idx])
 
     # -------------------------
     # TAB 3: CATEGORIZED DECKLIST (WITH FLIP BUTTON & PREVIEW DETAILS)
     # -------------------------
     with tab_categorized:
         if df_deck.empty:
-            st.info("No cards in this deck yet! Use the '➕ Add Cards from Collection' tab above to add cards.")
+            st.info("No cards in this deck yet! Use the 'Add Cards from Collection' tab above to add cards.")
         else:
             for cat_name, cat_emoji in CATEGORY_ORDER:
                 cat_group = df_deck[df_deck['category'] == cat_name]
                 if not cat_group.empty:
                     cat_qty = int(cat_group['quantity'].sum())
-                    st.markdown(f"### {cat_emoji} {cat_name} ({cat_qty})")
+                    st.markdown(f"### {cat_name} ({cat_qty})")
 
                     for _, row in cat_group.iterrows():
                         f_idx, disp, has_faces, faces = get_card_display_details(row['card_name'], row, scope=f"cat_{deck_id}")
@@ -1863,11 +2175,11 @@ def render_deck_display(deck_id, deck_name):
                         with c_type:
                             st.write(disp['type_line'])
                         with c_preview:
-                            with st.popover("👁️ Preview"):
+                            with st.popover("Preview"):
                                 st.image(disp["image_url"], use_container_width=True)
                                 if has_faces:
                                     other_face_n = faces[1 - f_idx]["name"]
-                                    if st.button(f"🔄 Flip ({other_face_n})", key=f"cat_flip_{deck_id}_{row['card_name']}", use_container_width=True):
+                                    if st.button(f"Flip ({other_face_n})", key=f"cat_flip_{deck_id}_{row['card_name']}", use_container_width=True):
                                         toggle_card_face(row['card_name'], scope=f"cat_{deck_id}")
                                         st.rerun()
                                 kw_val = disp.get('keywords', '')
@@ -1879,7 +2191,7 @@ def render_deck_display(deck_id, deck_name):
                         with c_remove:
                             if st.button("🗑️", key=f"cat_rm_{deck_id}_{row['card_name']}", help=f"Remove {row['card_name']} and return to collection"):
                                 remove_card_from_deck(deck_id, row['card_name'], remove_all=False)
-                                st.toast(f"Removed {row['card_name']} — returned to collection!", icon="↩️")
+                                st.toast(f"Removed {row['card_name']} — returned to collection!")
                                 st.rerun()
                     st.divider()
 
@@ -1893,7 +2205,7 @@ def render_deck_display(deck_id, deck_name):
             # Row 1: Mana Curve (CMC) and Card Types Breakdown
             col_c1, col_c2 = st.columns(2)
             with col_c1:
-                st.subheader("📈 Mana Curve (CMC)")
+                st.subheader("Mana Curve (CMC)")
                 curve_dict = {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7+": 0}
                 for _, r in df_non_land.iterrows():
                     val = int(r['cmc']) if pd.notna(r['cmc']) else 0
@@ -1928,7 +2240,7 @@ def render_deck_display(deck_id, deck_name):
                 st.caption("Distribution of non-land cards by converted mana cost (CMC).")
 
             with col_c2:
-                st.subheader("🧩 Card Types Breakdown")
+                st.subheader("Card Types Breakdown")
                 type_counts = {}
                 for _, r in df_deck.iterrows():
                     c = r['category']
@@ -1957,7 +2269,7 @@ def render_deck_display(deck_id, deck_name):
             # Row 2: Color Breakdown and Keywords Breakdown
             col_b1, col_b2 = st.columns(2)
             with col_b1:
-                st.subheader("🎨 Color Breakdown")
+                st.subheader("Color Breakdown")
                 color_counts = {
                     "☀️ White (W)": 0,
                     "🔵 Blue (U)": 0,
@@ -2029,7 +2341,7 @@ def render_deck_display(deck_id, deck_name):
 
             with col_b2:
                 # Keywords Breakdown
-                st.subheader("🏷️ Deck Keywords Breakdown")
+                st.subheader("Deck Keywords Breakdown")
                 keyword_counts = {}
                 for _, r in df_deck.iterrows():
                     kws = str(r.get('keywords', '')).strip()
@@ -2067,7 +2379,7 @@ def render_deck_display(deck_id, deck_name):
 
             # Commander Compliance Audit (Checks combined color identity)
             st.divider()
-            st.subheader("🛡️ Commander Color Identity Audit")
+            st.subheader("Commander Color Identity Audit")
             if current_commander and combined_ci is not None:
                 illegal_list = []
                 for _, r in df_deck.iterrows():
@@ -2079,9 +2391,9 @@ def render_deck_display(deck_id, deck_name):
                 if not illegal_list:
                     identity_desc = ', '.join(sorted(combined_ci)) if combined_ci else 'Colorless'
                     cmdr_title = f"**{current_commander}**" + (f" & **{current_partner}**" if current_partner else "")
-                    st.success(f"✅ **100% Legal:** All cards match {cmdr_title}'s combined color identity ({identity_desc}).")
+                    st.success(f"**100% Legal:** All cards match {cmdr_title}'s combined color identity ({identity_desc}).")
                 else:
-                    st.error(f"⚠️ **{len(illegal_list)} Illegal Cards Detected:** {', '.join(illegal_list)}")
+                    st.error(f"**{len(illegal_list)} Illegal Cards Detected:** {', '.join(illegal_list)}")
                     if st.button("Purge All Illegal Cards", key=f"purge_illegal_{deck_id}"):
                         for ill in illegal_list:
                             remove_card_from_deck(deck_id, ill, remove_all=True)
@@ -2094,7 +2406,7 @@ def render_deck_display(deck_id, deck_name):
     # TAB 5: LAND BASE BALANCER & SUGGESTER
     # -------------------------
     with tab_lands:
-        st.subheader("🏔️ Automated Land Base Balancer & Suggester")
+        st.subheader("Automated Land Base Balancer & Suggester")
         st.markdown("""
             Balance your deck's mana base based on **spell colored mana symbols (pips)**, 
             your **existing non-basic lands** (which provide dual/tri-color mana fixing and occupy land slots), 
@@ -2112,23 +2424,23 @@ def render_deck_display(deck_id, deck_name):
         # 1. Target Total Lands Configuration
         c_lconf1, c_lconf2 = st.columns([1, 1])
         with c_lconf1:
-            st.markdown("#### 🎯 Target Total Lands")
+            st.markdown("#### Target Total Lands")
             st.caption("Customize your total land count based on your deck's strategy:")
             
             # Preset buttons
             c_p1, c_p2, c_p3, c_p4 = st.columns(4)
             chosen_preset = None
             with c_p1:
-                if st.button("⚡ 32 Lean", key=f"pre_32_{deck_id}", help="Low curve / cEDH (Avg CMC < 2.5)"):
+                if st.button("32 Lean", key=f"pre_32_{deck_id}", help="Low curve / cEDH (Avg CMC < 2.5)"):
                     chosen_preset = 32
             with c_p2:
-                if st.button("⚖️ 36 Standard", key=f"pre_36_{deck_id}", help="Classic balanced Commander standard"):
+                if st.button("36 Standard", key=f"pre_36_{deck_id}", help="Classic balanced Commander standard"):
                     chosen_preset = 36
             with c_p3:
-                if st.button("🛡️ 38 Resilient", key=f"pre_38_{deck_id}", help="Midrange / Battlecruiser (Avg CMC ~ 3.5)"):
+                if st.button("38 Resilient", key=f"pre_38_{deck_id}", help="Midrange / Battlecruiser (Avg CMC ~ 3.5)"):
                     chosen_preset = 38
             with c_p4:
-                if st.button("🌱 40 Landfall", key=f"pre_40_{deck_id}", help="Landfall engines or heavy mana curves (Avg CMC > 3.8)"):
+                if st.button("40 Landfall", key=f"pre_40_{deck_id}", help="Landfall engines or heavy mana curves (Avg CMC > 3.8)"):
                     chosen_preset = 40
 
             t_val_key = f"target_lands_num_{deck_id}"
@@ -2147,13 +2459,13 @@ def render_deck_display(deck_id, deck_name):
             )
 
         with c_lconf2:
-            st.markdown("#### ⚖️ Non-Basic Land Weighting Strategy")
+            st.markdown("#### Non-Basic Land Weighting Strategy")
             st.caption("How non-basic lands should influence your basic land split:")
             bal_mode_choice = st.radio(
                 "Color Distribution Model",
                 [
-                    "⚖️ Deficit-Compensated (Accounts for Non-Basic Land Colors)",
-                    "📊 Pure Spell Pip Proportional (Ignores Non-Basic Colors)"
+                    "Deficit-Compensated (Accounts for Non-Basic Land Colors)",
+                    "Pure Spell Pip Proportional (Ignores Non-Basic Colors)"
                 ],
                 key=f"bal_mode_{deck_id}",
                 help="Deficit-Compensated detects which colors your non-basic lands already fix, giving extra basic lands to neglected colors."
@@ -2177,17 +2489,17 @@ def render_deck_display(deck_id, deck_name):
         # 3. High-level Metrics Row
         st.markdown("---")
         m_l1, m_l2, m_l3, m_l4 = st.columns(4)
-        m_l1.metric("🎯 Target Total Lands", f"{target_lands}")
-        m_l2.metric("🏰 Non-Basic Lands in Deck", f"{cur_nonbasics}")
-        m_l3.metric("🏔️ Needed Basic Lands", f"{needed_basics}", delta=f"{needed_basics - cur_basics:+d} vs current basics" if cur_basics else None)
+        m_l1.metric("Target Total Lands", f"{target_lands}")
+        m_l2.metric("Non-Basic Lands in Deck", f"{cur_nonbasics}")
+        m_l3.metric("Needed Basic Lands", f"{needed_basics}", delta=f"{needed_basics - cur_basics:+d} vs current basics" if cur_basics else None)
         resulting_deck_size = total_non_land + target_lands
-        m_l4.metric("🃏 Projected Deck Size", f"{resulting_deck_size} / 100", delta=f"{resulting_deck_size - 100:+d}" if resulting_deck_size != 100 else "Perfect 100!")
+        m_l4.metric("Projected Deck Size", f"{resulting_deck_size} / 100", delta=f"{resulting_deck_size - 100:+d}" if resulting_deck_size != 100 else "Perfect 100!")
 
         if cur_nonbasics >= target_lands:
-            st.warning(f"⚠️ You already have **{cur_nonbasics}** non-basic lands in the deck, which meets or exceeds your target of **{target_lands}** total lands! To add basic lands, increase your target land count above {cur_nonbasics}.")
+            st.warning(f"You already have **{cur_nonbasics}** non-basic lands in the deck, which meets or exceeds your target of **{target_lands}** total lands! To add basic lands, increase your target land count above {cur_nonbasics}.")
 
         # 4. Color & Pip Analysis Table
-        st.markdown("#### 📊 Color Pip Demand vs. Non-Basic Lands & Mana Fixers (Rocks/Dorks)")
+        st.markdown("#### Color Pip Demand vs. Non-Basic Lands & Mana Fixers (Rocks/Dorks)")
         COLOR_NAMES = {
             "W": "White (Plains)",
             "U": "Blue (Island)",
@@ -2245,17 +2557,17 @@ def render_deck_display(deck_id, deck_name):
         if total_ramp > 0:
             rec_lands = max(28, min(42, 40 - int(cheap_ramp / 2)))
             st.info(
-                f"⚡ **Mana-Fixing Permanents & Ramp Package Detected ({total_ramp} cards):**  \n"
+                f"**Mana-Fixing Permanents & Ramp Package Detected ({total_ramp} cards):**  \n"
                 f"• **{len(mana_rocks)} Mana Rocks** (e.g. Sol Ring, Signets, Talismans) | "
                 f"• **{len(mana_dorks)} Mana Dorks** (e.g. Birds of Paradise, Elves) | "
                 f"• **{len(ramp_spells)} Ramp Spells** (e.g. Cultivate)  \n"
-                f"💡 *Karsten Mana Heuristics*: You run **{cheap_ramp}** low-cost ramp pieces (CMC ≤ 2). "
+                f"*Karsten Mana Heuristics*: You run **{cheap_ramp}** low-cost ramp pieces (CMC ≤ 2). "
                 f"Every 2 cheap ramp spells offset ~1 land drop, recommending a baseline of **~{rec_lands} lands** "
                 f"(effective total mana base: **{target_lands + total_ramp}** sources)."
             )
 
         # 5. Adjustable Basic Land Allocation & Apply
-        st.markdown("#### 🎛️ Proposed Basic Land Allocation")
+        st.markdown("#### Proposed Basic Land Allocation")
         st.caption("You can fine-tune the calculated numbers below before applying them to your deck:")
 
         # Filter basic lands to display based on active colors
@@ -2274,7 +2586,7 @@ def render_deck_display(deck_id, deck_name):
             with alloc_cols[idx]:
                 sug_val = int(suggested_basics.get(b_name, 0))
                 user_val = st.number_input(
-                    f"🏔️ {b_name}",
+                    f"{b_name}",
                     min_value=0,
                     max_value=60,
                     value=sug_val,
@@ -2289,14 +2601,14 @@ def render_deck_display(deck_id, deck_name):
         col_sum1, col_sum2 = st.columns([2, 1])
         with col_sum1:
             if total_resulting_lands == target_lands:
-                st.success(f"✅ **Perfect Match:** {total_adjusted_basics} Basics + {cur_nonbasics} Non-Basics = **{total_resulting_lands} Total Lands** (hits your target of {target_lands}).")
+                st.success(f"**Perfect Match:** {total_adjusted_basics} Basics + {cur_nonbasics} Non-Basics = **{total_resulting_lands} Total Lands** (hits your target of {target_lands}).")
             else:
                 diff = total_resulting_lands - target_lands
-                st.info(f"ℹ️ **Current Allocation:** {total_adjusted_basics} Basics + {cur_nonbasics} Non-Basics = **{total_resulting_lands} Total Lands** ({diff:+d} from target {target_lands}).")
+                st.info(f"**Current Allocation:** {total_adjusted_basics} Basics + {cur_nonbasics} Non-Basics = **{total_resulting_lands} Total Lands** ({diff:+d} from target {target_lands}).")
 
         with col_sum2:
             st.write("")
-            apply_lands_btn = st.button("🚀 Apply Land Base to Deck", type="primary", use_container_width=True, key=f"btn_apply_lands_{deck_id}")
+            apply_lands_btn = st.button("Apply Land Base to Deck", type="primary", use_container_width=True, key=f"btn_apply_lands_{deck_id}")
 
         if apply_lands_btn:
             # 1. Remove all existing basic lands from the deck
@@ -2313,12 +2625,12 @@ def render_deck_display(deck_id, deck_name):
                         add_card_to_collection(b_name, needed_stock)
                     add_card_to_deck(deck_id, b_name, b_qty)
 
-            st.toast(f"Updated deck land base to {total_resulting_lands} lands ({total_adjusted_basics} basics + {cur_nonbasics} non-basics)!", icon="🏔️")
+            st.toast(f"Updated deck land base to {total_resulting_lands} lands ({total_adjusted_basics} basics + {cur_nonbasics} non-basics)!")
             st.rerun()
 
         # 6. Strategic Mana Base Insights
         st.markdown("---")
-        with st.expander("💡 Mana Base Diagnostics & Best Practices", expanded=False):
+        with st.expander("Mana Base Diagnostics & Best Practices", expanded=False):
             st.markdown(f"""
             - **Average Mana Value (CMC)**: `{avg_cmc:.2f}` non-land average.
               - Standard Commander recommendations:
@@ -2331,10 +2643,10 @@ def render_deck_display(deck_id, deck_name):
             for c in active_colors:
                 if nb_sources.get(c, 0) == 0:
                     c_name = COLOR_NAMES.get(c, c)
-                    st.warning(f"⚠️ **Notice:** You currently have **0 non-basic lands** producing {c_name}. Your mana base will rely strictly on Basic {BASIC_MAP.get(c)} to cast {c_name} spells. Consider adding dual lands or *Command Tower*.")
+                    st.warning(f"**Notice:** You currently have **0 non-basic lands** producing {c_name}. Your mana base will rely strictly on Basic {BASIC_MAP.get(c)} to cast {c_name} spells. Consider adding dual lands or *Command Tower*.")
 
     with tab_optimize:
-        st.subheader("🤖 AI Deck Optimizer (Local Ollama LLM)")
+        st.subheader("AI Deck Optimizer (Local Ollama LLM)")
         st.markdown("""
             Analyze your deck and receive intelligent upgrade recommendations from your **physical binder collection**.
             To prevent context window overflow and maximize reasoning performance, cards are evaluated in **compact batches**, 
@@ -2364,12 +2676,12 @@ def render_deck_display(deck_id, deck_name):
             st.write("")
             st.write("")
             if is_online:
-                st.success("🟢 Online", icon="✅")
+                st.success("Online")
             else:
-                st.error("🔴 Offline", icon="⚠️")
+                st.error("Offline")
 
         if not is_online:
-            st.info("💡 **Ollama not detected?** Start Ollama on your computer with `ollama serve` in a terminal. (Make sure you have pulled a model like `llama3` or `gpt-oss:20b`).")
+            st.info("**Ollama not detected?** Start Ollama on your computer with `ollama serve` in a terminal. (Make sure you have pulled a model like `llama3` or `gpt-oss:20b`).")
 
         # 2. Local Candidate Pool Stats (strictly local DB)
         deck_card_names = set(df_deck['card_name'].tolist()) if not df_deck.empty else set()
@@ -2391,19 +2703,19 @@ def render_deck_display(deck_id, deck_name):
                 candidate_cards.append(r)
 
         p_col1, p_col2, p_col3 = st.columns(3)
-        p_col1.metric("🃏 Current Deck Cards", f"{total_cards} / 100")
-        p_col2.metric("📦 Compatible Binder Candidates", f"{len(candidate_cards)}")
-        p_col3.metric("🎨 Deck Identity", f"{', '.join(sorted(combined_ci)) if combined_ci else 'Colorless'}")
+        p_col1.metric("Current Deck Cards", f"{total_cards} / 100")
+        p_col2.metric("Compatible Binder Candidates", f"{len(candidate_cards)}")
+        p_col3.metric("Deck Identity", f"{', '.join(sorted(combined_ci)) if combined_ci else 'Colorless'}")
 
         # 3. Optional User Prompt & Batch Settings
         user_guidance = st.text_area(
-            "💡 Strategic Guidance & Focus Areas (Optional)",
+            "Strategic Guidance & Focus Areas (Optional)",
             placeholder="e.g. Focus on ramp and card draw, lower the average mana curve, strengthen sacrifice synergies, recommend more instant-speed removal...",
             key=f"ol_guidance_{deck_id}",
             height=80
         )
 
-        with st.expander("⚙️ Advanced Batching & Context Window Tuning", expanded=False):
+        with st.expander("Advanced Batching & Context Window Tuning", expanded=False):
             col_b1, col_b2 = st.columns(2)
             with col_b1:
                 batch_size = st.select_slider(
@@ -2432,10 +2744,10 @@ def render_deck_display(deck_id, deck_name):
 
         col_btn1, col_btn2 = st.columns([2, 1])
         with col_btn1:
-            run_opt = st.button("🚀 Analyze & Optimize Deck with Ollama", type="primary", use_container_width=True, key=f"btn_run_opt_{deck_id}")
+            run_opt = st.button("Analyze & Optimize Deck with Ollama", type="primary", use_container_width=True, key=f"btn_run_opt_{deck_id}")
         with col_btn2:
             if opt_key in st.session_state and st.session_state[opt_key]:
-                if st.button("🗑️ Clear Analysis", key=f"btn_clear_opt_{deck_id}", use_container_width=True):
+                if st.button("Clear Analysis", key=f"btn_clear_opt_{deck_id}", use_container_width=True):
                     st.session_state[opt_key] = None
                     st.rerun()
 
@@ -2446,7 +2758,7 @@ def render_deck_display(deck_id, deck_name):
                 st.warning("No compatible cards found in your binder to evaluate.")
             else:
                 progress_bar = st.progress(0.0)
-                status_box = st.status(f"🚀 Running Multi-Batch Optimization ({len(batches)} Batches)...", expanded=True)
+                status_box = st.status(f"Running Multi-Batch Optimization ({len(batches)} Batches)...", expanded=True)
                 t_start = time.time()
 
                 concise_deck = format_deck_concise_for_llm(df_deck)
@@ -2462,7 +2774,7 @@ def render_deck_display(deck_id, deck_name):
                         b_num = b_idx + 1
                         progress_val = float(b_idx) / float(len(batches) + 1)
                         progress_bar.progress(progress_val)
-                        status_box.write(f"🔍 **Batch {b_num}/{len(batches)}**: Evaluating {len(batch)} binder candidates against current deck...")
+                        status_box.write(f"**Batch {b_num}/{len(batches)}**: Evaluating {len(batch)} binder candidates against current deck...")
 
                         batch_cand_str = "\n".join([format_candidate_card_concise(r) for r in batch])
 
@@ -2501,14 +2813,14 @@ SWAP: Cut [Card Name in Deck] -> Add [Candidate Card Name] | Reason: [Concise 1-
 
                         # Save proposed changes of this batch into the temporary array
                         if "no swaps" not in batch_resp.lower() and len(batch_resp.strip()) > 5:
-                            status_box.write(f"  ✨ Found potential upgrades in Batch {b_num}!")
+                            status_box.write(f"  Found potential upgrades in Batch {b_num}!")
                             proposed_swaps_pool.append(f"### Batch {b_num} Proposals ({len(batch)} candidates evaluated):\n{batch_resp.strip()}")
                         else:
-                            status_box.write(f"  ⏩ No upgrades warranted in Batch {b_num}.")
+                            status_box.write(f"  No upgrades warranted in Batch {b_num}.")
 
                     # Confirmation and Synthesis Pass
                     progress_bar.progress(float(len(batches)) / float(len(batches) + 1))
-                    status_box.write("🧠 **Final Confirmation Pass**: Sending all proposed changes from the approved array to confirm and synthesize the final cohesive upgrade plan...")
+                    status_box.write("**Final Confirmation Pass**: Sending all proposed changes from the approved array to confirm and synthesize the final cohesive upgrade plan...")
 
                     if proposed_swaps_pool:
                         pool_text = "\n\n".join(proposed_swaps_pool)
@@ -2537,20 +2849,20 @@ CRITICAL RULES:
 3. Ensure the mana curve and land count remain functional.
 
 Please format your response in clean Markdown:
-1. 📊 **Executive Assessment & Mana Curve Diagnosis**
-2. 🔄 **Final Confirmed Swaps**:
+1. **Executive Assessment & Mana Curve Diagnosis**
+2. **Final Confirmed Swaps**:
    Format each confirmed swap clearly:
-   - ❌ **Cut:** [Card Name] (CMC, Type) — *Why to cut*
-   - ➕ **Add:** [Card Name] (CMC, Type) — *Tactical justification & synergy*
-3. 🎯 **Deck Impact & Playstyle Evolution**
+   - **Cut:** [Card Name] (CMC, Type) — *Why to cut*
+   - **Add:** [Card Name] (CMC, Type) — *Tactical justification & synergy*
+3. **Deck Impact & Playstyle Evolution**
 """
                         final_resp = call_ollama(confirm_prompt, model=chosen_model, base_url=ollama_url)
                     else:
-                        final_resp = "### 📋 Deck Assessment\nThe AI evaluated all compatible cards in your binder across all batches and determined that your current deck is already well-optimized relative to your available collection! No high-impact swaps were recommended."
+                        final_resp = "### Deck Assessment\nThe AI evaluated all compatible cards in your binder across all batches and determined that your current deck is already well-optimized relative to your available collection! No high-impact swaps were recommended."
 
                     t_elapsed = time.time() - t_start
                     progress_bar.progress(1.0)
-                    status_box.update(label=f"✅ Optimization complete in {t_elapsed:.1f}s ({len(batches)} batches evaluated)!", state="complete", expanded=False)
+                    status_box.update(label=f"Optimization complete in {t_elapsed:.1f}s ({len(batches)} batches evaluated)!", state="complete", expanded=False)
 
                     st.session_state[opt_key] = {
                         "model": chosen_model,
@@ -2564,14 +2876,14 @@ Please format your response in clean Markdown:
                     st.rerun()
 
                 except Exception as e:
-                    status_box.update(label="❌ Optimization encountered an error", state="error")
+                    status_box.update(label="Optimization encountered an error", state="error")
                     st.error(f"Error calling local Ollama LLM: {e}")
 
         # 5. Display Stored Results
         if opt_key in st.session_state and st.session_state[opt_key]:
             res = st.session_state[opt_key]
             st.divider()
-            st.markdown(f"### 📋 Final Optimization Report (`{res['model']}`) — *{res['candidates_evaluated']} binder cards evaluated in {res['batch_count']} batches ({res['duration']:.1f}s)*")
+            st.markdown(f"### Final Optimization Report (`{res['model']}`) — *{res['candidates_evaluated']} binder cards evaluated in {res['batch_count']} batches ({res['duration']:.1f}s)*")
 
             with st.container(border=True):
                 st.markdown(res["response"])
@@ -2582,22 +2894,22 @@ Please format your response in clean Markdown:
             extracted = extract_swaps_from_text(res["response"], deck_set, binder_set)
 
             if extracted:
-                st.markdown("#### ⚡ Quick-Apply Confirmed Swaps")
+                st.markdown("#### Quick-Apply Confirmed Swaps")
                 st.caption("Apply recommended swaps directly to your deck with one click:")
                 for cut_c, add_c in extracted:
                     col_sw1, col_sw2 = st.columns([3, 1])
                     with col_sw1:
-                        st.markdown(f"• **Cut** `{cut_c}` ➔ **Add** `{add_c}`")
+                        st.markdown(f"• **Cut** `{cut_c}` -> **Add** `{add_c}`")
                     with col_sw2:
-                        if st.button(f"⚡ Apply Swap", key=f"btn_swap_{deck_id}_{cut_c}_{add_c}", use_container_width=True):
+                        if st.button(f"Apply Swap", key=f"btn_swap_{deck_id}_{cut_c}_{add_c}", use_container_width=True):
                             remove_card_from_deck(deck_id, cut_c, remove_all=False)
                             add_card_to_deck(deck_id, add_c, 1)
-                            st.toast(f"Swapped {cut_c} for {add_c}!", icon="⚡")
+                            st.toast(f"Swapped {cut_c} for {add_c}!")
                             st.rerun()
 
             # Inspect intermediate proposals from the temporary array
             if res.get("raw_batch_proposals"):
-                with st.expander(f"📦 Inspect Intermediate Batch Proposals Pool ({len(res['raw_batch_proposals'])} batches with proposals)"):
+                with st.expander(f"Inspect Intermediate Batch Proposals Pool ({len(res['raw_batch_proposals'])} batches with proposals)"):
                     st.caption("Below is the temporary array of candidate proposals gathered across all batches before the final confirmation pass:")
                     for prop in res["raw_batch_proposals"]:
                         st.markdown(prop)
@@ -2606,7 +2918,7 @@ Please format your response in clean Markdown:
     # TAB 6: EXPORT DECKLIST
     # -------------------------
     with tab_export:
-        st.subheader("📤 Export Decklist")
+        st.subheader("Export Decklist")
         export_mode = st.radio("Export Format", ["Categorized MTG Format", "MTG Arena / MTGO Flat Format"], horizontal=True, key=f"exp_mode_{deck_id}")
 
         if export_mode == "Categorized MTG Format":
@@ -2641,7 +2953,7 @@ Please format your response in clean Markdown:
 
         st.text_area("Decklist Text", export_text, height=260, key=f"exp_text_{deck_id}")
         st.download_button(
-            label="💾 Download Decklist (.txt)",
+            label="Download Decklist (.txt)",
             data=export_text,
             file_name=f"{deck_name.replace(' ', '_')}.txt",
             mime="text/plain",
@@ -2651,7 +2963,7 @@ Please format your response in clean Markdown:
     # ---------------------------------------------------------
     # DECK OPTIONS (RENAME, DUPLICATE, DELETE)
     # ---------------------------------------------------------
-    with st.expander("⚙️ Deck Options"):
+    with st.expander("Deck Options"):
         col_opt1, col_opt2 = st.columns(2)
         with col_opt1:
             st.markdown("**Rename Deck**")
@@ -2676,6 +2988,7 @@ Please format your response in clean Markdown:
                     for _, r in df_deck.iterrows():
                         execute_db("INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)",
                                    (int(new_d_id), r['card_name'], int(r['quantity'])))
+                    st.session_state.active_deck_id = int(new_d_id)
                     st.session_state.selected_deck_display = dup_name.strip()
                     st.success(f"Duplicated deck as '{dup_name.strip()}'!")
                     st.rerun()
@@ -2684,6 +2997,7 @@ Please format your response in clean Markdown:
         if st.button("🗑️ Delete this deck", key=f"del_entire_deck_{deck_id}"):
             execute_db("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
             execute_db("DELETE FROM decks WHERE id = ?", (deck_id,))
+            st.session_state.active_deck_id = None
             st.success(f"Deck '{deck_name}' deleted — all cards returned to collection!")
             st.rerun()
 
@@ -2712,15 +3026,35 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🧙‍♂️ MTG Collection & Deck Manager")
+st.title("MTG Collection & Deck Manager")
 
 # Sidebar Navigation
-NAV_PAGES = ["📚 My Binder (Collection)", "🃏 Deck Builder", "🎴 Deck Display", "📥 Import Decklist"]
+NAV_PAGES = ["📚 My Binder (Collection)", "🎴 Decks", "📥 Import Decklist"]
 
-if "nav_radio" not in st.session_state:
-    st.session_state.nav_radio = NAV_PAGES[0]
+if "nav_radio" not in st.session_state or st.session_state.nav_radio in ["🃏 Deck Builder", "🎴 Deck Display"]:
+    st.session_state.nav_radio = "🎴 Decks" if st.session_state.get("nav_radio") in ["🃏 Deck Builder", "🎴 Deck Display"] else NAV_PAGES[0]
 
 page = st.sidebar.radio("Navigation", NAV_PAGES, key="nav_radio")
+
+# Sidebar System Logs Viewer
+with st.sidebar.expander("System Logs", expanded=False):
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                log_lines = f.readlines()
+            recent_logs = "".join(log_lines[-40:])
+            st.text_area("Recent Logs", recent_logs, height=200, disabled=True)
+            col_l1, col_l2 = st.columns(2)
+            with col_l1:
+                if st.button("Refresh", key="btn_refresh_logs", use_container_width=True):
+                    st.rerun()
+            with col_l2:
+                if st.button("Clear", key="btn_clear_logs", use_container_width=True):
+                    with open(LOG_FILE, "w", encoding="utf-8") as f:
+                        f.write("")
+                    st.rerun()
+        except Exception:
+            st.caption("No log entries available.")
 
 # ------------------------------------------
 # PAGE 1: MY BINDER (INVENTORY + MASS ADD + EDIT/REMOVE)
@@ -2752,39 +3086,21 @@ if page == "📚 My Binder (Collection)":
     # --- TAB 2: MASS ADD ---
     with tab2:
         st.markdown("Paste a list of cards to add to your collection at once.")
-        st.caption("Supported formats: `4 Sol Ring`, `1x Counterspell`, or just `Brainstorm` (defaults to 1).")
+        st.caption("Supported formats: `4 Sol Ring`, `1x Counterspell`, `1 Sol Ring (CMR) 351 *F*`, or just `Brainstorm` (defaults to 1).")
 
         mass_text = st.text_area("Paste Card List", height=200,
                                  placeholder="4 Lightning Bolt\n2x Counterspell\n1 Sol Ring\nSwamp")
 
         if st.button("Add All Cards to Binder") and mass_text:
-            lines = mass_text.strip().split("\n")
-            parsed_items = [parse_card_line(line) for line in lines if line.strip()]
+            lines = mass_text.strip().splitlines()
+            parsed_items = [parse_card_line(line) for line in lines if parse_card_line(line) is not None]
 
             if parsed_items:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
-                successful = []
-                failed = []
-
-                total = len(parsed_items)
-                for idx, (qty, card_name) in enumerate(parsed_items):
-                    status_text.text(f"Processing ({idx + 1}/{total}): {card_name}...")
-                    added_name = add_card_to_collection(card_name, qty)
-
-                    if added_name:
-                        successful.append({"Card": added_name, "Qty Added": qty})
-                    else:
-                        failed.append({"Card": card_name, "Qty": qty})
-
-                    progress_bar.progress((idx + 1) / total)
-                    time.sleep(0.08)
-
-                status_text.text("Import complete!")
+                with st.spinner(f"Processing {len(parsed_items)} cards via Scryfall Batch API..."):
+                    successful, failed = batch_add_cards_to_collection(parsed_items)
 
                 if successful:
-                    st.success(f"Successfully added {len(successful)} unique card titles to your binder!")
+                    st.success(f"Successfully added/updated {len(successful)} card titles in your binder!")
                     st.dataframe(pd.DataFrame(successful), use_container_width=True)
                 if failed:
                     st.error(f"Failed to find {len(failed)} cards on Scryfall:")
@@ -2795,7 +3111,7 @@ if page == "📚 My Binder (Collection)":
     # --- TAB 3: EDIT / REMOVE CARDS (INTERACTIVE GRID WITH - [QTY] +) ---
     with tab3:
         st.subheader("Manage Collection Quantities (Interactive Grid)")
-        st.caption("Use the **➖ [qty] ➕** buttons on each card to increment or decrement physical copies owned.")
+        st.caption("Use the **- [qty] +** buttons on each card to increment or decrement physical copies owned.")
 
         all_col_cards = run_query("""
             SELECT card_name, total_owned, total_assigned, quantity_available, 
@@ -2804,12 +3120,12 @@ if page == "📚 My Binder (Collection)":
             ORDER BY card_name ASC
         """)
         if all_col_cards.empty:
-            st.info("No cards in your binder yet. Add cards in **➕ Add Single Card** or **📦 Mass Add Cards**!")
+            st.info("No cards in your binder yet. Add cards in **Add Single Card** or **Mass Add Cards**!")
         else:
             # Filter bar for the grid
             col_gf1, col_gf2, col_gf3 = st.columns([2, 1, 1])
             with col_gf1:
-                grid_search = st.text_input("🔍 Search Card (Name, Text)", placeholder="e.g. Sol Ring, Dragon, Draw a card...", key="edit_grid_search")
+                grid_search = st.text_input("Search Card (Name, Text)", placeholder="e.g. Sol Ring, Dragon, Draw a card...", key="edit_grid_search")
             with col_gf2:
                 grid_cat = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key="edit_grid_cat")
             with col_gf3:
@@ -2853,35 +3169,35 @@ if page == "📚 My Binder (Collection)":
                             st.caption(f"{cost_l} • {bdisp['type_line']}")
 
                             if cur_avail > 0:
-                                st.caption(f"🟢 **{cur_avail}** free / **{cur_assigned}** in decks")
+                                st.caption(f"✅ **{cur_avail}** free / **{cur_assigned}** in decks")
                             else:
-                                st.caption(f"🔴 **0** free / **{cur_assigned}** in decks")
+                                st.caption(f"❌ **0** free / **{cur_assigned}** in decks")
 
                             # Stepper: [-]  {cur_owned}  [+]
                             c_dec, c_num, c_inc = st.columns([1, 1, 1])
                             with c_dec:
-                                if st.button("➖", key=f"b_dec_{c_name}", help="Remove 1 copy"):
+                                if st.button("-1", key=f"b_dec_{c_name}", help="Remove 1 copy"):
                                     if cur_owned > 1:
                                         new_q = cur_owned - 1
                                         execute_db("UPDATE collection SET total_owned = ? WHERE card_name = ?", (new_q, c_name))
                                         if new_q < cur_assigned:
-                                            st.toast(f"⚠️ {c_name} owned ({new_q}) is now less than assigned across decks ({cur_assigned})!", icon="⚠️")
+                                            st.toast(f"{c_name} owned ({new_q}) is now less than assigned across decks ({cur_assigned})!")
                                         else:
-                                            st.toast(f"Updated {c_name} to {new_q} copies!", icon="➖")
+                                            st.toast(f"Updated {c_name} to {new_q} copies!")
                                     else:
                                         execute_db("DELETE FROM deck_cards WHERE card_name = ?", (c_name,))
                                         execute_db("DELETE FROM collection WHERE card_name = ?", (c_name,))
-                                        st.toast(f"Removed {c_name} from binder!", icon="🗑️")
+                                        st.toast(f"Removed {c_name} from binder!")
                                     st.rerun()
 
                             with c_num:
                                 st.markdown(f"<div style='text-align:center; font-size:1.25rem; font-weight:bold; padding-top:4px;'>{cur_owned}</div>", unsafe_allow_html=True)
 
                             with c_inc:
-                                if st.button("➕", key=f"b_inc_{c_name}", help="Add 1 copy"):
+                                if st.button("+1", key=f"b_inc_{c_name}", help="Add 1 copy"):
                                     new_q = cur_owned + 1
                                     execute_db("UPDATE collection SET total_owned = ? WHERE card_name = ?", (new_q, c_name))
-                                    st.toast(f"Updated {c_name} to {new_q} copies!", icon="➕")
+                                    st.toast(f"Updated {c_name} to {new_q} copies!")
                                     st.rerun()
 
                             # Flip button & Details / Delete Popover
@@ -2889,7 +3205,7 @@ if page == "📚 My Binder (Collection)":
                             with col_sub1:
                                 if b_has_faces:
                                     other_face_n = b_faces[1 - f_idx]["name"]
-                                    if st.button("🔄", key=f"b_flip_{c_name}", help=f"Flip: {other_face_n}"):
+                                    if st.button("Flip", key=f"b_flip_{c_name}", help=f"Flip: {other_face_n}"):
                                         toggle_card_face(c_name, scope="binder_grid")
                                         st.rerun()
                                 else:
@@ -2898,11 +3214,11 @@ if page == "📚 My Binder (Collection)":
                                 with st.popover("🗑️", help="Delete card completely"):
                                     st.markdown(f"Delete **{c_name}** from collection?")
                                     if cur_assigned > 0:
-                                        st.warning(f"⚠️ {cur_assigned} copy/copies are in decks! Deleting removes them too.")
+                                        st.warning(f"{cur_assigned} copy/copies are in decks! Deleting removes them too.")
                                     if st.button("Confirm Delete", key=f"del_pop_{c_name}", type="primary"):
                                         execute_db("DELETE FROM deck_cards WHERE card_name = ?", (c_name,))
                                         execute_db("DELETE FROM collection WHERE card_name = ?", (c_name,))
-                                        st.toast(f"Deleted {c_name}!", icon="🗑️")
+                                        st.toast(f"Deleted {c_name}!")
                                         st.rerun()
                             st.divider()
 
@@ -2919,9 +3235,9 @@ if page == "📚 My Binder (Collection)":
     if missing_count > 0:
         c_sync1, c_sync2 = st.columns([3, 1])
         with c_sync1:
-            st.info(f"ℹ️ **{missing_count} cards** in your database are missing card text or keywords.")
+            st.info(f"**{missing_count} cards** in your database are missing card text or keywords.")
         with c_sync2:
-            if st.button("🔄 Sync Card Text & Keywords", help="Fetches card text, keywords, and face data for cards missing them"):
+            if st.button("Sync Card Text & Keywords", help="Fetches card text, keywords, and face data for cards missing them"):
                 cards_to_sync = run_query("SELECT card_name FROM collection WHERE oracle_text IS NULL OR oracle_text = '' OR keywords IS NULL")['card_name'].tolist()
                 p_sync = st.progress(0)
                 status_sync = st.empty()
@@ -2937,9 +3253,9 @@ if page == "📚 My Binder (Collection)":
     # Search and Filter Binder
     col_bs, col_bkw = st.columns([2, 2])
     with col_bs:
-        binder_search = st.text_input("🔍 Search Binder (Card Name, Oracle Text)", placeholder="e.g. draw a card, counter target...", key="binder_search_input")
+        binder_search = st.text_input("Search Binder (Card Name, Oracle Text)", placeholder="e.g. draw a card, counter target...", key="binder_search_input")
     with col_bkw:
-        binder_kw_filter = st.text_input("🏷️ Filter by Keyword", placeholder="e.g. Flying, Trample, Ward...", key="binder_kw_input")
+        binder_kw_filter = st.text_input("Filter by Keyword", placeholder="e.g. Flying, Trample, Ward...", key="binder_kw_input")
 
     query_binder = """
         SELECT 
@@ -2972,86 +3288,189 @@ if page == "📚 My Binder (Collection)":
         st.info("Your binder is currently empty or no cards match your filters.")
 
 # ------------------------------------------
-# PAGE 2: DECK BUILDER
+# PAGE 2: DECKS (VISUAL GALLERY & DECK BUILDER)
 # ------------------------------------------
-elif page == "🃏 Deck Builder":
-    st.header("Deck Builder")
+elif page == "🎴 Decks":
+    decks = run_query("SELECT id, name, commander, partner_commander FROM decks ORDER BY name ASC")
 
-    decks = run_query("SELECT id, name FROM decks")
-    deck_names = decks['name'].tolist() if not decks.empty else []
+    # State tracking for active deck
+    if "active_deck_id" not in st.session_state:
+        st.session_state.active_deck_id = None
 
-    col1, col2 = st.columns(2)
-    with col1:
-        selected_deck = st.selectbox("Select a Deck", ["-- Create New Deck --"] + deck_names)
+    # Validate active_deck_id
+    if st.session_state.active_deck_id is not None:
+        if decks.empty or st.session_state.active_deck_id not in decks['id'].values:
+            st.session_state.active_deck_id = None
 
-    if selected_deck == "-- Create New Deck --":
-        with col2:
-            new_deck_name = st.text_input("New Deck Name")
-            new_cmdr_name = st.text_input("Commander Name (Optional)", placeholder="e.g. Atraxa, Praetors' Voice")
-            if st.button("Create Deck") and new_deck_name:
-                execute_db("INSERT INTO decks (name, commander) VALUES (?, ?)", 
-                           (new_deck_name.strip(), new_cmdr_name.strip() if new_cmdr_name else None))
-                if new_cmdr_name and new_cmdr_name.strip():
-                    c_data = fetch_scryfall_data(new_cmdr_name.strip())
-                    if c_data:
+    if st.session_state.active_deck_id is None:
+        # ==========================================
+        # VIEW 1: VISUAL DECK GALLERY
+        # ==========================================
+        col_hdr1, col_hdr2 = st.columns([4, 1.2])
+        with col_hdr1:
+            st.header("Your Commander Decks")
+            st.caption("Click any deck to open its full Deck Builder, mana curve analytics, and land base balancer.")
+        with col_hdr2:
+            st.write("")
+            with st.popover("Add New Deck", use_container_width=True):
+                st.markdown("### Create New Commander Deck")
+                new_d_name = st.text_input("Deck Name", placeholder="e.g. Atraxa Proliferation", key="modal_new_d_name")
+                new_d_cmdr = st.text_input("Commander Name (Optional)", placeholder="e.g. Atraxa, Praetors' Voice", key="modal_new_d_cmdr")
+                if st.button("Create & Open Deck", type="primary", use_container_width=True, key="btn_create_modal_deck"):
+                    if new_d_name.strip():
+                        execute_db("INSERT INTO decks (name) VALUES (?)", (new_d_name.strip(),))
                         conn = sqlite3.connect(DB_NAME)
-                        new_id = pd.read_sql_query("SELECT id FROM decks WHERE name = ?", conn, params=(new_deck_name.strip(),)).iloc[0]['id']
+                        new_id = int(pd.read_sql_query("SELECT id FROM decks WHERE name = ?", conn, params=(new_d_name.strip(),)).iloc[0]['id'])
                         conn.close()
-                        add_card_to_deck(int(new_id), c_data['name'], 1)
-                        add_card_to_collection(c_data['name'], 1)
-                st.success(f"Created Commander deck: {new_deck_name.strip()}")
-                st.session_state.selected_deck_display = new_deck_name.strip()
+                        if new_d_cmdr.strip():
+                            set_deck_commander(new_id, new_d_cmdr.strip())
+                        st.session_state.active_deck_id = new_id
+                        st.session_state.selected_deck_display = new_d_name.strip()
+                        st.success(f"Created '{new_d_name.strip()}'!")
+                        st.rerun()
+
+        if decks.empty:
+            st.info("No decks found yet! Click **Add New Deck** above or import one from **Import Decklist**.")
+        else:
+            # Query card counts for all decks in one query
+            counts_df = run_query("""
+                SELECT deck_id, COUNT(card_name) as unique_cards, COALESCE(SUM(quantity), 0) as total_cards
+                FROM deck_cards
+                GROUP BY deck_id
+            """)
+            counts_map = {}
+            if not counts_df.empty:
+                for _, r in counts_df.iterrows():
+                    counts_map[int(r['deck_id'])] = (int(r['unique_cards']), int(r['total_cards']))
+
+            # Display decks in responsive grid
+            deck_cols_num = 3
+            deck_rows = [decks.iloc[i:i + deck_cols_num] for i in range(0, len(decks), deck_cols_num)]
+
+            for r_df in deck_rows:
+                cols = st.columns(deck_cols_num)
+                for idx, (_, d_row) in enumerate(r_df.iterrows()):
+                    with cols[idx]:
+                        with st.container(border=True):
+                            d_id = int(d_row['id'])
+                            d_name = str(d_row['name'])
+                            d_cmdr = str(d_row['commander']).strip() if pd.notna(d_row['commander']) and d_row['commander'] else None
+                            d_part = str(d_row['partner_commander']).strip() if pd.notna(d_row['partner_commander']) and d_row['partner_commander'] else None
+
+                            u_cards, t_cards = counts_map.get(d_id, (0, 0))
+
+                            # Commander image & color identity
+                            cmdr_img = None
+                            cmdr_ci = set()
+                            if d_cmdr:
+                                c_info = get_cached_card(d_cmdr) or fetch_scryfall_data(d_cmdr)
+                                if c_info:
+                                    cmdr_img = c_info.get("image_url")
+                                    cmdr_ci = parse_color_identity(c_info.get("color_identity", ""))
+                            if d_part:
+                                p_info = get_cached_card(d_part) or fetch_scryfall_data(d_part)
+                                if p_info:
+                                    cmdr_ci = cmdr_ci.union(parse_color_identity(p_info.get("color_identity", "")))
+
+                            if not cmdr_img:
+                                cmdr_img = "https://cards.scryfall.io/back.png"
+
+                            try:
+                                st.image(cmdr_img, use_container_width=True)
+                            except Exception:
+                                st.caption("Card art unavailable")
+
+                            # Deck name in bold below image
+                            st.markdown(f"### {d_name}")
+
+                            # Commander title
+                            if d_cmdr:
+                                c_label = f"**{d_cmdr}** (Commander)"
+                                if d_part:
+                                    c_label += f" & {d_part}"
+                                st.markdown(c_label)
+                            else:
+                                st.caption("*No commander set*")
+
+                            # Identity & card count badge
+                            ci_emojis = " ".join([COLOR_EMOJI_MAP.get(c, c) for c in sorted(cmdr_ci)]) if cmdr_ci else "🔘 Colorless"
+                            st.caption(f"{ci_emojis} • **{t_cards}/100** cards")
+
+                            # Clickable button leading directly to deck builder
+                            if st.button("Open Deck Builder", key=f"btn_open_deck_{d_id}", type="primary", use_container_width=True):
+                                st.session_state.active_deck_id = d_id
+                                st.session_state.selected_deck_display = d_name
+                                st.rerun()
+
+    else:
+        # ==========================================
+        # VIEW 2: ACTIVE DECK BUILDER & DISPLAY
+        # ==========================================
+        active_id = st.session_state.active_deck_id
+        active_deck_row = decks[decks['id'] == active_id]
+        if active_deck_row.empty:
+            st.session_state.active_deck_id = None
+            st.rerun()
+
+        active_name = active_deck_row.iloc[0]['name']
+
+        # Top breadcrumb and quick action bar
+        c_nav_back, c_nav_switch, c_nav_new = st.columns([1.5, 3, 1.5])
+        with c_nav_back:
+            if st.button("◀ Back to All Decks", key="btn_back_to_all_decks", use_container_width=True):
+                st.session_state.active_deck_id = None
                 st.rerun()
-    else:
-        deck_id = int(decks[decks['name'] == selected_deck]['id'].iloc[0])
-        render_deck_display(deck_id, selected_deck)
+        with c_nav_switch:
+            all_deck_names = decks['name'].tolist()
+            cur_idx = all_deck_names.index(active_name) if active_name in all_deck_names else 0
+            switched = st.selectbox("Quick Switch Deck", all_deck_names, index=cur_idx, key="active_deck_quick_switch", label_visibility="collapsed")
+            if switched != active_name:
+                st.session_state.active_deck_id = int(decks[decks['name'] == switched]['id'].iloc[0])
+                st.session_state.selected_deck_display = switched
+                st.rerun()
+        with c_nav_new:
+            with st.popover("Add New Deck", use_container_width=True):
+                st.markdown("### Create New Commander Deck")
+                new_d_name = st.text_input("Deck Name", placeholder="e.g. Atraxa Proliferation", key="modal_new_d_name_sub")
+                new_d_cmdr = st.text_input("Commander (Optional)", placeholder="e.g. Atraxa, Praetors' Voice", key="modal_new_d_cmdr_sub")
+                if st.button("Create & Open Deck", type="primary", use_container_width=True, key="btn_create_modal_deck_sub"):
+                    if new_d_name.strip():
+                        execute_db("INSERT INTO decks (name) VALUES (?)", (new_d_name.strip(),))
+                        conn = sqlite3.connect(DB_NAME)
+                        new_id = int(pd.read_sql_query("SELECT id FROM decks WHERE name = ?", conn, params=(new_d_name.strip(),)).iloc[0]['id'])
+                        conn.close()
+                        if new_d_cmdr.strip():
+                            set_deck_commander(new_id, new_d_cmdr.strip())
+                        st.session_state.active_deck_id = new_id
+                        st.session_state.selected_deck_display = new_d_name.strip()
+                        st.rerun()
+
+        # Render full deck builder tabs
+        render_deck_display(active_id, active_name)
 
 # ------------------------------------------
-# PAGE 3: DECK DISPLAY
-# ------------------------------------------
-elif page == "🎴 Deck Display":
-    st.header("🎴 Deck Display & Analytics")
-
-    decks = run_query("SELECT id, name FROM decks")
-    deck_names = decks['name'].tolist() if not decks.empty else []
-
-    if not deck_names:
-        st.info("No decks found yet! Create a deck in the **🃏 Deck Builder** or import one from **📥 Import Decklist**.")
-    else:
-        selected_idx = 0
-        if "selected_deck_display" in st.session_state and st.session_state.selected_deck_display in deck_names:
-            selected_idx = deck_names.index(st.session_state.selected_deck_display)
-
-        col_deck_sel, col_space = st.columns([3, 1])
-        with col_deck_sel:
-            chosen_deck = st.selectbox("Select Deck to Display", deck_names, index=selected_idx, key="deck_display_select")
-            st.session_state.selected_deck_display = chosen_deck
-
-        deck_id = int(decks[decks['name'] == chosen_deck]['id'].iloc[0])
-        render_deck_display(deck_id, chosen_deck)
-
-# ------------------------------------------
-# PAGE 4: IMPORT DECKLIST
+# PAGE 3: IMPORT DECKLIST
 # ------------------------------------------
 elif page == "📥 Import Decklist":
     st.header("Import Decklist & Audit Collection")
-    st.markdown("Paste a decklist to assign your owned cards and highlight missing cards.")
+    st.markdown("Paste a decklist to assign owned cards from your binder, highlight missing cards, and auto-detect Commanders.")
 
-    # Show persistent audit results from session state to avoid nested button issues
+    # Show persistent audit results from session state
     if "import_audit_result" in st.session_state and st.session_state.import_audit_result:
         res = st.session_state.import_audit_result
         d_name = res["deck_name"]
+        d_id = res.get("deck_id")
         st.success(f"Deck **{d_name}** has been processed!")
 
-        c_nav1, c_nav2 = st.columns([1, 3])
+        c_nav1, c_nav2 = st.columns([1.5, 3])
         with c_nav1:
-            if st.button(f"👁️ View '{d_name}' in Deck Display", key="btn_view_imported_nav"):
+            if st.button(f"Open '{d_name}' in Deck Builder", key="btn_view_imported_nav"):
+                st.session_state.active_deck_id = d_id
                 st.session_state.selected_deck_display = d_name
-                st.session_state.nav_radio = "🎴 Deck Display"
-                st.session_state.nav_page = "🎴 Deck Display"
+                st.session_state.nav_radio = "🎴 Decks"
                 st.rerun()
         with c_nav2:
-            if st.button("🔄 Clear & Import Another Deck", key="btn_clear_imported_nav"):
+            if st.button("Clear & Import Another Deck", key="btn_clear_imported_nav"):
                 st.session_state.import_audit_result = None
                 st.rerun()
 
@@ -3071,48 +3490,77 @@ elif page == "📥 Import Decklist":
         st.divider()
 
     deck_name = st.text_input("Name for imported deck", key="inp_import_deck_name")
-    decklist_text = st.text_area("Paste Decklist", height=250, placeholder="1 Sol Ring\n1 Counterspell\n1 Mana Crypt", key="inp_import_decklist_txt")
+    decklist_text = st.text_area("Paste Decklist", height=250, placeholder="// Commander\n1 Atraxa, Praetors' Voice\n\n1 Sol Ring\n1 Counterspell\n1 Mana Crypt", key="inp_import_decklist_txt")
 
     if st.button("Import & Audit", key="btn_do_import") and deck_name and decklist_text:
-        lines = decklist_text.strip().split("\n")
-        parsed_cards = [parse_card_line(line) for line in lines if line.strip()]
+        parsed_deck = parse_decklist_text(decklist_text)
+        parsed_cards = parsed_deck["cards"]
+        commanders = parsed_deck["commanders"]
 
         if not parsed_cards:
-            st.error("Could not parse the decklist.")
+            st.error("Could not parse the decklist. Check the format!")
         else:
             execute_db("INSERT OR IGNORE INTO decks (name) VALUES (?)", (deck_name.strip(),))
             conn = sqlite3.connect(DB_NAME)
-            deck_id = pd.read_sql_query("SELECT id FROM decks WHERE name = ?", conn, params=(deck_name.strip(),)).iloc[0]['id']
+            deck_id = int(pd.read_sql_query("SELECT id FROM decks WHERE name = ?", conn, params=(deck_name.strip(),)).iloc[0]['id'])
             conn.close()
+
+            # Batch fetch all cards in the decklist via Scryfall Batch Collection API
+            all_card_names = [c[1] for c in parsed_cards]
+            with st.spinner(f"Resolving {len(all_card_names)} cards via Scryfall Batch API..."):
+                card_cache_map = batch_fetch_scryfall_cards(all_card_names)
+
+            # Auto-assign detected commanders (without duplicate copies!)
+            if commanders:
+                first_cmdr = commanders[0]
+                set_deck_commander(deck_id, first_cmdr)
+                if len(commanders) > 1:
+                    set_deck_commander(deck_id, commanders[1], is_partner=True)
 
             assigned, missing = [], []
 
-            for qty_needed, card in parsed_cards:
-                # Find canonical card name from binder or Scryfall cache
-                df_avail = run_query("SELECT card_name, quantity_available FROM v_available_cards WHERE card_name LIKE ?", (card,))
-                if not df_avail.empty:
-                    canonical_name = df_avail.iloc[0]['card_name']
-                    available = int(df_avail.iloc[0]['quantity_available'])
-                else:
-                    s_card = fetch_scryfall_data(card)
-                    canonical_name = s_card['name'] if s_card else card
-                    available = 0
+            # Deduplicate and aggregate quantities in imported decklist
+            card_qty_sum = {}
+            for q, raw_n in parsed_cards:
+                card_qty_sum[raw_n] = card_qty_sum.get(raw_n, 0) + q
+            aggregated_cards = [(q, raw_n) for raw_n, q in card_qty_sum.items()]
+
+            for qty_needed, raw_card_name in aggregated_cards:
+                # Find canonical name
+                card_obj = card_cache_map.get(raw_card_name)
+                canonical_name = card_obj["name"] if card_obj else raw_card_name
+
+                # If this card is already assigned as the commander, it's already in deck_cards with qty=1
+                canonical_commanders = [card_cache_map.get(c, {}).get('name', c) if isinstance(card_cache_map.get(c), dict) else c for c in commanders]
+                if canonical_name in commanders or canonical_name in canonical_commanders:
+                    assigned.append({'Card': canonical_name, 'Qty Added': 1})
+                    continue
+
+                df_avail = run_query("SELECT quantity_available FROM v_available_cards WHERE card_name = ?", (canonical_name,))
+                available = int(df_avail.iloc[0]['quantity_available']) if not df_avail.empty else 0
 
                 if available >= qty_needed:
-                    execute_db("INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)",
-                               (int(deck_id), canonical_name, qty_needed))
+                    execute_db("""
+                        INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)
+                        ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = ?
+                    """, (int(deck_id), canonical_name, qty_needed, qty_needed))
                     assigned.append({'Card': canonical_name, 'Qty Added': qty_needed})
                 elif available > 0:
-                    execute_db("INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)",
-                               (int(deck_id), canonical_name, available))
+                    execute_db("""
+                        INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)
+                        ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = ?
+                    """, (int(deck_id), canonical_name, available, available))
                     assigned.append({'Card': canonical_name, 'Qty Added': available})
                     missing.append({'Card': canonical_name, 'Shortage': qty_needed - available})
                 else:
                     missing.append({'Card': canonical_name, 'Shortage': qty_needed})
 
+            st.session_state.active_deck_id = deck_id
             st.session_state.import_audit_result = {
+                "deck_id": deck_id,
                 "deck_name": deck_name.strip(),
                 "assigned": assigned,
                 "missing": missing
             }
+            logger.info(f"Imported deck '{deck_name.strip()}' with {len(assigned)} assigned cards and {len(missing)} missing.")
             st.rerun()
