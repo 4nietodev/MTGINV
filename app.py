@@ -62,7 +62,7 @@ def init_db():
     # Check for missing columns in card_cache
     cursor.execute("PRAGMA table_info(card_cache)")
     cache_cols = [col[1] for col in cursor.fetchall()]
-    for col in ["image_url", "mana_cost", "oracle_text", "keywords", "faces_json", "produced_mana"]:
+    for col in ["image_url", "mana_cost", "oracle_text", "keywords", "faces_json", "produced_mana", "set_code", "collector_number"]:
         if col not in cache_cols:
             cursor.execute(f"ALTER TABLE card_cache ADD COLUMN {col} TEXT")
 
@@ -80,13 +80,15 @@ def init_db():
         oracle_text TEXT,
         keywords TEXT,
         faces_json TEXT,
-        produced_mana TEXT
+        produced_mana TEXT,
+        set_code TEXT,
+        collector_number TEXT
     )""")
 
     # Check for missing columns in collection
     cursor.execute("PRAGMA table_info(collection)")
     cols = [col[1] for col in cursor.fetchall()]
-    for col in ["image_url", "mana_cost", "oracle_text", "keywords", "faces_json", "produced_mana"]:
+    for col in ["image_url", "mana_cost", "oracle_text", "keywords", "faces_json", "produced_mana", "set_code", "collector_number"]:
         if col not in cols:
             cursor.execute(f"ALTER TABLE collection ADD COLUMN {col} TEXT")
 
@@ -117,7 +119,7 @@ def init_db():
         FOREIGN KEY (card_name) REFERENCES collection(card_name)
     )""")
 
-    # View for Available Cards (includes faces_json and produced_mana)
+    # View for Available Cards (includes faces_json, produced_mana, set_code, collector_number)
     cursor.execute("DROP VIEW IF EXISTS v_available_cards")
     cursor.execute("""
     CREATE VIEW v_available_cards AS
@@ -132,6 +134,8 @@ def init_db():
         c.keywords,
         c.faces_json,
         c.produced_mana,
+        c.set_code,
+        c.collector_number,
         c.total_owned,
         COALESCE(SUM(dc.quantity), 0) AS total_assigned,
         (c.total_owned - COALESCE(SUM(dc.quantity), 0)) AS quantity_available
@@ -159,7 +163,7 @@ def get_cached_card(card_name):
 
     # 1. Check collection table first
     cursor.execute("""
-        SELECT card_name, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana 
+        SELECT card_name, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number 
         FROM collection 
         WHERE card_name = ? OR card_name LIKE ?
     """, (cleaned, cleaned))
@@ -183,12 +187,14 @@ def get_cached_card(card_name):
             "keywords": row[7] or "",
             "faces_json": row[8] or "",
             "faces": faces_list,
-            "produced_mana": (row[9] if len(row) > 9 and row[9] else "") or ""
+            "produced_mana": (row[9] if len(row) > 9 and row[9] else "") or "",
+            "set_code": (row[10] if len(row) > 10 and row[10] else "") or "",
+            "collector_number": (row[11] if len(row) > 11 and row[11] else "") or ""
         }
 
     # 2. Check local card_cache table
     cursor.execute("""
-        SELECT card_name, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana 
+        SELECT card_name, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number 
         FROM card_cache 
         WHERE card_name = ? OR card_name LIKE ?
     """, (cleaned, cleaned))
@@ -212,7 +218,9 @@ def get_cached_card(card_name):
             "keywords": row_c[7] or "",
             "faces_json": row_c[8] or "",
             "faces": faces_list,
-            "produced_mana": (row_c[9] if len(row_c) > 9 and row_c[9] else "") or ""
+            "produced_mana": (row_c[9] if len(row_c) > 9 and row_c[9] else "") or "",
+            "set_code": (row_c[10] if len(row_c) > 10 and row_c[10] else "") or "",
+            "collector_number": (row_c[11] if len(row_c) > 11 and row_c[11] else "") or ""
         }
     return None
 
@@ -224,8 +232,8 @@ def save_to_card_cache(card_data):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO card_cache (card_name, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO card_cache (card_name, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(card_name) DO UPDATE SET
             cmc = excluded.cmc,
             type_line = excluded.type_line,
@@ -235,11 +243,14 @@ def save_to_card_cache(card_data):
             oracle_text = excluded.oracle_text,
             keywords = excluded.keywords,
             faces_json = excluded.faces_json,
-            produced_mana = excluded.produced_mana
+            produced_mana = excluded.produced_mana,
+            set_code = excluded.set_code,
+            collector_number = excluded.collector_number
     """, (card_data["name"], card_data.get("cmc", 0.0), card_data.get("type_line", ""),
           card_data.get("color_identity", ""), card_data.get("image_url", ""),
           card_data.get("mana_cost", ""), card_data.get("oracle_text", ""), card_data.get("keywords", ""),
-          card_data.get("faces_json"), card_data.get("produced_mana", "")))
+          card_data.get("faces_json"), card_data.get("produced_mana", ""),
+          card_data.get("set_code", ""), card_data.get("collector_number", "")))
     conn.commit()
     conn.close()
 
@@ -314,8 +325,68 @@ def _parse_scryfall_card_json(data, fallback_name=""):
         "keywords": keywords_str,
         "faces_json": faces_json_str,
         "faces": faces_list,
-        "produced_mana": produced_mana_str
+        "produced_mana": produced_mana_str,
+        "set_code": str(data.get("set", "")).upper(),
+        "set_name": str(data.get("set_name", "")),
+        "collector_number": str(data.get("collector_number", "")),
+        "released_at": str(data.get("released_at", ""))
     }
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_card_printings(card_name):
+    """
+    Fetches all distinct historical printings and artworks for a card from Scryfall API.
+    Returns list of printings ordered from newest to oldest.
+    """
+    if not card_name or not str(card_name).strip():
+        return []
+    clean_name = str(card_name).strip()
+    try:
+        url = f"https://api.scryfall.com/cards/search?q=!\"{requests.utils.quote(clean_name)}\"+include:extras&unique=prints&order=released"
+        resp = requests.get(url, headers=SCRYFALL_HEADERS, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            printings = []
+            for item in data:
+                parsed = _parse_scryfall_card_json(item)
+                printings.append({
+                    "id": item.get("id"),
+                    "name": parsed["name"],
+                    "set_code": item.get("set", "").upper(),
+                    "set_name": item.get("set_name", ""),
+                    "collector_number": item.get("collector_number", ""),
+                    "released_at": str(item.get("released_at", ""))[:4] if item.get("released_at") else "",
+                    "image_url": parsed["image_url"],
+                    "faces": parsed.get("faces", []),
+                    "faces_json": parsed.get("faces_json"),
+                    "card_data": parsed
+                })
+            return printings
+    except Exception as e:
+        logger.warning(f"Error fetching printings for '{clean_name}': {e}")
+    return []
+
+
+def update_card_printing(card_name, card_data):
+    """Updates the chosen printing / artwork for a card in the collection and card_cache."""
+    img_url = card_data.get("image_url", "")
+    faces_json = card_data.get("faces_json")
+    set_code = card_data.get("set_code", "")
+    col_num = card_data.get("collector_number", "")
+
+    execute_db("""
+        UPDATE collection 
+        SET image_url = ?, faces_json = ?, set_code = ?, collector_number = ?
+        WHERE card_name = ?
+    """, (img_url, faces_json, set_code, col_num, card_name))
+
+    execute_db("""
+        UPDATE card_cache 
+        SET image_url = ?, faces_json = ?, set_code = ?, collector_number = ?
+        WHERE card_name = ?
+    """, (img_url, faces_json, set_code, col_num, card_name))
+    logger.info(f"Updated printing for '{card_name}' to [{set_code} #{col_num}].")
 
 
 def fetch_scryfall_data(card_name):
@@ -376,33 +447,65 @@ def batch_fetch_scryfall_cards(card_names):
     Batches lookups for multiple cards using Scryfall's /cards/collection endpoint.
     Batches in chunks of up to 75, respects rate limits (0.12s wait between requests),
     handles 429 backoff, falls back to fuzzy single lookup for not_found cards,
-    and returns a dict of {canonical_name: card_data}.
+    and returns a dict of {lookup_key: card_data}.
+    Supports exact printing and artwork matching when set and collector number are provided.
     """
     if not card_names:
         return {}
 
-    # Deduplicate while preserving order
-    unique_names = []
+    normalized_items = []
     seen = set()
-    for name in card_names:
-        clean = str(name).strip()
-        if clean and clean.lower() not in seen:
-            seen.add(clean.lower())
-            unique_names.append(clean)
+    for item in card_names:
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+            s = item.get("set") or item.get("set_code")
+            cn = item.get("collector_number")
+        elif hasattr(item, "name"):
+            name = str(item.name).strip()
+            s = getattr(item, "set_code", None)
+            cn = getattr(item, "collector_number", None)
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            name = str(item[1]).strip()
+            s = getattr(item, "set_code", None) or (item[2] if len(item) > 2 else None)
+            cn = getattr(item, "collector_number", None) or (item[3] if len(item) > 3 else None)
+        else:
+            name = str(item).strip()
+            s = None
+            cn = None
+
+        if not name:
+            continue
+
+        ident_key = f"{name.lower()}|{str(s or '').lower()}|{str(cn or '').lower()}"
+        if ident_key not in seen:
+            seen.add(ident_key)
+            normalized_items.append({
+                "raw_item": item,
+                "name": name,
+                "set": str(s).lower() if s else None,
+                "collector_number": str(cn).lower() if cn else None,
+                "ident_key": ident_key
+            })
 
     results = {}
     missing_from_cache = []
 
-    # 1. Check local cache first
-    for name in unique_names:
+    # 1. Check local cache first (if no specific printing is requested, or if cache matches printing)
+    for norm in normalized_items:
+        name = norm["name"]
         cached = get_cached_card(name)
-        if cached:
+        if cached and not norm["set"]:
             results[cached["name"]] = cached
             results[name] = cached
+            results[norm["ident_key"]] = cached
+        elif cached and norm["set"] and cached.get("set_code", "").lower() == norm["set"]:
+            results[cached["name"]] = cached
+            results[name] = cached
+            results[norm["ident_key"]] = cached
         else:
-            missing_from_cache.append(name)
+            missing_from_cache.append(norm)
 
-    logger.info(f"Batch fetch: {len(unique_names)} total cards ({len(results)} from cache, {len(missing_from_cache)} to fetch from Scryfall)")
+    logger.info(f"Batch fetch: {len(normalized_items)} total cards ({len(results)} from cache, {len(missing_from_cache)} to fetch from Scryfall)")
 
     if not missing_from_cache:
         return results
@@ -412,7 +515,16 @@ def batch_fetch_scryfall_cards(card_names):
     batches = [missing_from_cache[i:i + batch_size] for i in range(0, len(missing_from_cache), batch_size)]
 
     for b_idx, batch in enumerate(batches):
-        payload = {"identifiers": [{"name": n} for n in batch]}
+        payload_idents = []
+        for n in batch:
+            if n["set"] and n["collector_number"]:
+                payload_idents.append({"set": n["set"], "collector_number": n["collector_number"]})
+            elif n["set"]:
+                payload_idents.append({"name": n["name"], "set": n["set"]})
+            else:
+                payload_idents.append({"name": n["name"]})
+
+        payload = {"identifiers": payload_idents}
         headers = {**SCRYFALL_HEADERS, "Content-Type": "application/json"}
         
         logger.info(f"Sending batch {b_idx + 1}/{len(batches)} ({len(batch)} cards) to Scryfall /cards/collection...")
@@ -438,12 +550,15 @@ def batch_fetch_scryfall_cards(card_names):
                 parsed = _parse_scryfall_card_json(c_obj)
                 save_to_card_cache(parsed)
                 results[parsed["name"]] = parsed
-                # Also map against raw requested name
-                for req_n in batch:
-                    req_clean = req_n.strip().lower()
+                results[parsed["name"].lower()] = parsed
+                # Map against batch entries
+                for req_item in batch:
+                    req_clean = req_item["name"].strip().lower()
                     card_clean = parsed["name"].strip().lower()
                     if req_clean == card_clean or card_clean.startswith(req_clean + " //"):
-                        results[req_n] = parsed
+                        results[req_item["name"]] = parsed
+                        results[req_item["ident_key"]] = parsed
+                        results[str(req_item["raw_item"])] = parsed
                         
             # Handle not_found fallback with individual fuzzy queries
             not_found = res_json.get("not_found", [])
@@ -459,12 +574,12 @@ def batch_fetch_scryfall_cards(card_names):
                             results[nf_name] = single_card
         else:
             logger.error(f"Batch {b_idx + 1} failed with status: {resp.status_code if resp else 'No Response'}. Falling back to individual queries...")
-            for card_n in batch:
+            for req_item in batch:
                 time.sleep(0.15)
-                single_card = fetch_scryfall_data(card_n)
+                single_card = fetch_scryfall_data(req_item["name"])
                 if single_card:
                     results[single_card["name"]] = single_card
-                    results[card_n] = single_card
+                    results[req_item["name"]] = single_card
 
         # Courtesy delay between Scryfall collection batch petitions (120ms)
         time.sleep(0.12)
@@ -627,10 +742,30 @@ def get_card_category(type_line):
     return "Other"
 
 
+class ParsedCard(tuple):
+    """
+    Subclass of tuple (qty, name) for complete backward compatibility with (qty, name) unpacking,
+    while carrying set_code and collector_number attributes for artwork recognition.
+    """
+    def __new__(cls, qty, name, set_code=None, collector_number=None):
+        return super().__new__(cls, (qty, name))
+
+    def __init__(self, qty, name, set_code=None, collector_number=None):
+        self.qty = qty
+        self.name = name
+        self.set_code = set_code
+        self.collector_number = collector_number
+
+    def __repr__(self):
+        s_part = f" [{self.set_code.upper()} #{self.collector_number}]" if self.set_code else ""
+        return f"<ParsedCard {self.qty}x {self.name}{s_part}>"
+
+
 def parse_card_line(line):
     """
     Parses lines like '4 Sol Ring', '1x Counterspell', '1 Sol Ring (CMR) 351 *F*',
-    or 'Brainstorm'. Returns (qty, clean_card_name) or None if line is empty or comment.
+    or 'Brainstorm'. Returns ParsedCard(qty, clean_card_name, set_code, collector_number)
+    or None if line is empty or comment.
     """
     if not line:
         return None
@@ -654,17 +789,27 @@ def parse_card_line(line):
     else:
         name_part = raw
 
-    # Strip set codes & collector numbers e.g. "(CMR) 351", "[NEO] 22", "(MH2)"
-    name_part = re.sub(r'\s*[\(\[][A-Za-z0-9_]{2,6}[\)\]](\s*\S+)?', '', name_part).strip()
     # Strip foil / etched tags e.g. *F*, *foil*, #foil
     name_part = re.sub(r'[\*#].*$', '', name_part).strip()
+
+    # Extract set codes & collector numbers e.g. "(CMR) 351", "[NEO] 22", "(MH2)"
+    set_code = None
+    collector_num = None
+    set_match = re.search(r'[\(\[]([A-Za-z0-9_]{2,6})[\)\]]\s*([A-Za-z0-9_\-]+)?', name_part)
+    if set_match:
+        set_code = set_match.group(1).lower()
+        if set_match.group(2):
+            collector_num = set_match.group(2).strip()
+        name_part = name_part[:set_match.start()] + name_part[set_match.end():]
+
+    name_part = name_part.strip()
     # Normalize split cards slash "Fire / Ice" -> "Fire // Ice"
     if "/" in name_part and "//" not in name_part:
         name_part = re.sub(r'\s*/\s*', ' // ', name_part).strip()
 
     if not name_part:
         return None
-    return qty, name_part
+    return ParsedCard(qty, name_part, set_code, collector_num)
 
 
 def parse_decklist_text(text):
@@ -705,7 +850,7 @@ def parse_decklist_text(text):
         if in_commander_section or '*cmdr*' in raw.lower() or '*commander*' in raw.lower():
             if name not in commanders:
                 commanders.append(name)
-        cards.append((qty, name))
+        cards.append(res)
 
     return {'commanders': commanders, 'cards': cards}
 
@@ -732,14 +877,16 @@ def execute_db(query, params=()):
         conn.close()
 
 
-def add_card_to_collection(card_name, qty):
-    """Adds or increases card count in the collection table."""
-    card_data = fetch_scryfall_data(card_name)
+def add_card_to_collection(card_name, qty, printing_data=None):
+    """Adds or increases card count in the collection table, using specific printing/art if specified."""
+    card_data = printing_data if printing_data else fetch_scryfall_data(card_name)
     if card_data:
         name = card_data["name"]
+        set_code = card_data.get("set_code", "")
+        collector_number = card_data.get("collector_number", "")
         execute_db("""
-            INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(card_name) DO UPDATE SET 
                 total_owned = total_owned + ?,
                 cmc = excluded.cmc,
@@ -750,11 +897,14 @@ def add_card_to_collection(card_name, qty):
                 oracle_text = CASE WHEN excluded.oracle_text IS NOT NULL AND excluded.oracle_text != '' THEN excluded.oracle_text ELSE collection.oracle_text END,
                 keywords = CASE WHEN excluded.keywords IS NOT NULL AND excluded.keywords != '' THEN excluded.keywords ELSE collection.keywords END,
                 faces_json = CASE WHEN excluded.faces_json IS NOT NULL AND excluded.faces_json != '' THEN excluded.faces_json ELSE collection.faces_json END,
-                produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END
+                produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END,
+                set_code = CASE WHEN excluded.set_code IS NOT NULL AND excluded.set_code != '' THEN excluded.set_code ELSE collection.set_code END,
+                collector_number = CASE WHEN excluded.collector_number IS NOT NULL AND excluded.collector_number != '' THEN excluded.collector_number ELSE collection.collector_number END
         """, (name, qty, card_data["cmc"], card_data["type_line"], card_data["color_identity"],
               card_data.get("image_url"), card_data.get("mana_cost"), card_data.get("oracle_text", ""), card_data.get("keywords", ""),
-              card_data.get("faces_json"), card_data.get("produced_mana", ""), qty))
-        logger.info(f"Added {qty}x '{name}' to collection.")
+              card_data.get("faces_json"), card_data.get("produced_mana", ""), set_code, collector_number, qty))
+        save_to_card_cache(card_data)
+        logger.info(f"Added {qty}x '{name}' [{set_code} #{collector_number}] to collection.")
         return name
     return None
 
@@ -762,23 +912,14 @@ def add_card_to_collection(card_name, qty):
 def batch_add_cards_to_collection(parsed_items):
     """
     Batches lookups using Scryfall batch collection API and updates the collection in a single transaction.
-    parsed_items: list of (qty, card_name)
+    parsed_items: list of ParsedCard, tuples, or strings
     Returns: (successful_list, failed_list)
     """
     if not parsed_items:
         return [], []
 
-    # Aggregate quantities for duplicate names
-    qty_map = {}
-    for qty, name in parsed_items:
-        clean_n = str(name).strip()
-        if clean_n:
-            qty_map[clean_n] = qty_map.get(clean_n, 0) + int(qty)
-
-    all_names = list(qty_map.keys())
-    logger.info(f"Starting batch collection add for {len(all_names)} unique card entries...")
-
-    card_data_map = batch_fetch_scryfall_cards(all_names)
+    logger.info(f"Starting batch collection add for {len(parsed_items)} unique card entries...")
+    card_data_map = batch_fetch_scryfall_cards(parsed_items)
 
     successful = []
     failed = []
@@ -787,20 +928,33 @@ def batch_add_cards_to_collection(parsed_items):
     cursor = conn.cursor()
 
     try:
-        for name, qty in qty_map.items():
-            card_info = card_data_map.get(name)
+        for item in parsed_items:
+            qty = getattr(item, "qty", item[0] if isinstance(item, (tuple, list)) else 1)
+            raw_name = getattr(item, "name", item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else str(item))
+            s_code = getattr(item, "set_code", None)
+            c_num = getattr(item, "collector_number", None)
+
+            ident_key = f"{str(raw_name).lower()}|{str(s_code or '').lower()}|{str(c_num or '').lower()}"
+
+            card_info = card_data_map.get(ident_key) \
+                     or card_data_map.get(str(item)) \
+                     or card_data_map.get(raw_name) \
+                     or card_data_map.get(str(raw_name).lower())
+
             if not card_info:
                 # Try case-insensitive lookup in map
                 for k, v in card_data_map.items():
-                    if k.lower() == name.lower():
+                    if str(k).lower() == str(raw_name).lower():
                         card_info = v
                         break
 
             if card_info:
                 canonical = card_info["name"]
+                set_code = card_info.get("set_code", "")
+                collector_number = card_info.get("collector_number", "")
                 cursor.execute("""
-                    INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(card_name) DO UPDATE SET 
                         total_owned = total_owned + ?,
                         cmc = excluded.cmc,
@@ -811,13 +965,15 @@ def batch_add_cards_to_collection(parsed_items):
                         oracle_text = CASE WHEN excluded.oracle_text IS NOT NULL AND excluded.oracle_text != '' THEN excluded.oracle_text ELSE collection.oracle_text END,
                         keywords = CASE WHEN excluded.keywords IS NOT NULL AND excluded.keywords != '' THEN excluded.keywords ELSE collection.keywords END,
                         faces_json = CASE WHEN excluded.faces_json IS NOT NULL AND excluded.faces_json != '' THEN excluded.faces_json ELSE collection.faces_json END,
-                        produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END
+                        produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END,
+                        set_code = CASE WHEN excluded.set_code IS NOT NULL AND excluded.set_code != '' THEN excluded.set_code ELSE collection.set_code END,
+                        collector_number = CASE WHEN excluded.collector_number IS NOT NULL AND excluded.collector_number != '' THEN excluded.collector_number ELSE collection.collector_number END
                 """, (canonical, qty, card_info["cmc"], card_info["type_line"], card_info["color_identity"],
                       card_info.get("image_url"), card_info.get("mana_cost"), card_info.get("oracle_text", ""), card_info.get("keywords", ""),
-                      card_info.get("faces_json"), card_info.get("produced_mana", ""), qty))
-                successful.append({"Card": canonical, "Qty Added": qty})
+                      card_info.get("faces_json"), card_info.get("produced_mana", ""), set_code, collector_number, qty))
+                successful.append({"Card": canonical, "Qty Added": qty, "Set": set_code, "Number": collector_number})
             else:
-                failed.append({"Card": name, "Qty": qty})
+                failed.append({"Card": raw_name, "Qty": qty})
 
         conn.commit()
         logger.info(f"Batch collection add complete: {len(successful)} added, {len(failed)} failed.")
@@ -3066,22 +3222,93 @@ if page == "📚 My Binder (Collection)":
 
     # --- TAB 1: SINGLE CARD ---
     with tab1:
-        with st.form("add_single_card_form"):
-            col1, col2, col3 = st.columns([3, 1, 1])
-            with col1:
-                new_card = st.text_input("Card Name")
-            with col2:
-                qty = st.number_input("Quantity", min_value=1, value=1)
-            with col3:
-                submit = st.form_submit_button("Add to Binder")
+        st.markdown("Search for an individual card to add to your collection.")
+        c_col1, c_col2 = st.columns([3, 1])
+        with c_col1:
+            new_card = st.text_input(
+                "Card Name",
+                placeholder="e.g. Sol Ring, Counterspell, or Sol Ring (CMR) 351",
+                key="single_card_name_input"
+            )
+        with c_col2:
+            qty = st.number_input("Quantity", min_value=1, value=1, key="single_card_qty_input")
 
-            if submit and new_card:
-                added_name = add_card_to_collection(new_card, qty)
-                if added_name:
-                    st.success(f"Added {qty}x **{added_name}** to your binder!")
-                    st.rerun()
-                else:
-                    st.error("Card not found on Scryfall. Check spelling!")
+        b_col1, b_col2, b_col3 = st.columns([1.5, 1.5, 2])
+        with b_col1:
+            btn_quick_add = st.button("Add Card (Default Art)", type="primary", use_container_width=True)
+        with b_col2:
+            btn_choose_art = st.button("Browse & Choose Artwork", use_container_width=True)
+        with b_col3:
+            st.write("")
+
+        # Handle Quick Add
+        if btn_quick_add and new_card.strip():
+            parsed_item = parse_card_line(f"{qty} {new_card.strip()}")
+            if parsed_item and parsed_item.set_code:
+                with st.spinner("Finding specific printing on Scryfall..."):
+                    res_map = batch_fetch_scryfall_cards([parsed_item])
+                    card_data = res_map.get(str(parsed_item)) or res_map.get(parsed_item.name)
+                    if card_data:
+                        added_name = add_card_to_collection(parsed_item.name, qty, printing_data=card_data)
+                        s_code = card_data.get('set_code', '')
+                        c_num = card_data.get('collector_number', '')
+                        st.success(f"Added {qty}x **{added_name}** [{s_code} #{c_num}] to your binder!")
+                        st.rerun()
+                    else:
+                        st.error(f"Could not find printing [{parsed_item.set_code.upper()}] for '{parsed_item.name}'.")
+            else:
+                target_name = parsed_item.name if parsed_item else new_card.strip()
+                with st.spinner(f"Looking up '{target_name}' on Scryfall..."):
+                    added_name = add_card_to_collection(target_name, qty)
+                    if added_name:
+                        st.success(f"Added {qty}x **{added_name}** to your binder!")
+                        st.rerun()
+                    else:
+                        st.error("Card not found on Scryfall. Check spelling!")
+
+        # Handle Browse Artwork
+        if btn_choose_art and new_card.strip():
+            st.session_state["active_art_search_card"] = new_card.strip()
+
+        active_search = st.session_state.get("active_art_search_card")
+        if active_search:
+            parsed_s = parse_card_line(active_search)
+            search_card_name = parsed_s.name if parsed_s else active_search
+
+            st.divider()
+            with st.spinner(f"Fetching printings for '{search_card_name}' from Scryfall..."):
+                printings = fetch_card_printings(search_card_name)
+
+            if printings:
+                c_title_col, c_close_col = st.columns([3, 1])
+                with c_title_col:
+                    st.subheader(f"Choose Printing & Artwork for '{search_card_name}'")
+                    st.caption(f"Found **{len(printings)}** distinct printings. Click **Choose This Art** to add it to your binder.")
+                with c_close_col:
+                    if st.button("Close Art Browser", key="btn_close_art_search", use_container_width=True):
+                        st.session_state["active_art_search_card"] = None
+                        st.rerun()
+
+                p_cols_count = 4
+                rows = [printings[i:i + p_cols_count] for i in range(0, len(printings), p_cols_count)]
+                for r_idx, r_chunk in enumerate(rows):
+                    p_cols = st.columns(p_cols_count)
+                    for c_idx, p in enumerate(r_chunk):
+                        with p_cols[c_idx]:
+                            try:
+                                st.image(p["image_url"], use_container_width=True)
+                            except Exception:
+                                st.caption("Image not available")
+                            st.markdown(f"**{p['set_name']}**")
+                            rel_year = f" ({p['released_at']})" if p.get("released_at") else ""
+                            st.caption(f"Set: `{p['set_code']}` #{p['collector_number']}{rel_year}")
+                            if st.button("Choose This Art", key=f"btn_pick_art_{p['id']}_{r_idx}_{c_idx}", use_container_width=True):
+                                added_name = add_card_to_collection(p["name"], qty, printing_data=p["card_data"])
+                                st.session_state["active_art_search_card"] = None
+                                st.success(f"Added {qty}x **{added_name}** ({p['set_name']} [{p['set_code']} #{p['collector_number']}]) to your binder!")
+                                st.rerun()
+            else:
+                st.warning(f"No printings found on Scryfall for '{search_card_name}'.")
 
     # --- TAB 2: MASS ADD ---
     with tab2:
@@ -3115,7 +3342,8 @@ if page == "📚 My Binder (Collection)":
 
         all_col_cards = run_query("""
             SELECT card_name, total_owned, total_assigned, quantity_available, 
-                   faces_json, image_url, mana_cost, type_line, oracle_text, keywords, produced_mana 
+                   faces_json, image_url, mana_cost, type_line, oracle_text, keywords, produced_mana,
+                   set_code, collector_number
             FROM v_available_cards 
             ORDER BY card_name ASC
         """)
@@ -3200,8 +3428,8 @@ if page == "📚 My Binder (Collection)":
                                     st.toast(f"Updated {c_name} to {new_q} copies!")
                                     st.rerun()
 
-                            # Flip button & Details / Delete Popover
-                            col_sub1, col_sub2 = st.columns([1, 1])
+                            # Action bar: Flip (if double-faced), Art switcher popover, Delete popover
+                            col_sub1, col_sub2, col_sub3 = st.columns([1, 1, 1])
                             with col_sub1:
                                 if b_has_faces:
                                     other_face_n = b_faces[1 - f_idx]["name"]
@@ -3211,6 +3439,45 @@ if page == "📚 My Binder (Collection)":
                                 else:
                                     st.write("")
                             with col_sub2:
+                                with st.popover("Art", help="Change card printing / artwork"):
+                                    cur_s = row_c.get("set_code") if hasattr(row_c, "get") else None
+                                    cur_num = row_c.get("collector_number") if hasattr(row_c, "get") else None
+                                    if cur_s and cur_num:
+                                        st.caption(f"Current: `{cur_s} #{cur_num}`")
+                                    elif cur_s:
+                                        st.caption(f"Current: `{cur_s}`")
+                                    else:
+                                        st.caption("Current: Default Art")
+
+                                    art_key = f"view_art_{c_name}"
+                                    if not st.session_state.get(art_key, False):
+                                        if st.button("Browse Art", key=f"btn_open_art_{c_name}", use_container_width=True):
+                                            st.session_state[art_key] = True
+                                            st.rerun()
+                                    else:
+                                        with st.spinner("Fetching printings..."):
+                                            prints = fetch_card_printings(c_name)
+                                        if prints:
+                                            st.caption(f"{len(prints)} printings:")
+                                            p_cols = st.columns(2)
+                                            for p_idx, p in enumerate(prints[:24]):
+                                                with p_cols[p_idx % 2]:
+                                                    try:
+                                                        st.image(p["image_url"], use_container_width=True)
+                                                    except Exception:
+                                                        st.caption("No image")
+                                                    st.caption(f"**{p['set_code']} #{p['collector_number']}**\n{p['set_name']}")
+                                                    if st.button("Select", key=f"sel_art_{c_name}_{p['id']}_{p_idx}", use_container_width=True):
+                                                        update_card_printing(c_name, p["card_data"])
+                                                        st.session_state[art_key] = False
+                                                        st.toast(f"Updated {c_name} to {p['set_code']} #{p['collector_number']}!")
+                                                        st.rerun()
+                                        else:
+                                            st.info("No alternate printings found.")
+                                        if st.button("Close", key=f"close_art_{c_name}", use_container_width=True):
+                                            st.session_state[art_key] = False
+                                            st.rerun()
+                            with col_sub3:
                                 with st.popover("🗑️", help="Delete card completely"):
                                     st.markdown(f"Delete **{c_name}** from collection?")
                                     if cur_assigned > 0:
@@ -3261,6 +3528,8 @@ if page == "📚 My Binder (Collection)":
         SELECT 
             card_name as 'Card', 
             mana_cost as 'Mana Cost',
+            set_code as 'Set',
+            collector_number as '#',
             type_line as 'Type', 
             keywords as 'Keywords',
             total_owned as 'Total Owned', 
@@ -3485,6 +3754,22 @@ elif page == "📥 Import Decklist":
             st.subheader("❌ Missing from Collection")
             if res["missing"]:
                 st.table(pd.DataFrame(res["missing"]))
+                if res.get("missing_parsed"):
+                    if st.button("Add All Missing Cards to Binder", key="btn_add_missing_audit", type="primary"):
+                        with st.spinner("Adding missing cards and artwork to your collection..."):
+                            batch_add_cards_to_collection(res["missing_parsed"])
+                            for item in res["missing_parsed"]:
+                                execute_db("""
+                                    INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)
+                                    ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = quantity + ?
+                                """, (int(d_id), item.name, item.qty, item.qty))
+                        st.toast(f"Added {len(res['missing_parsed'])} missing cards to your binder and assigned them to {d_name}!")
+                        st.session_state.import_audit_result["assigned"].extend(
+                            [{'Card': m['Card'], 'Qty Added': m['Shortage']} for m in res["missing"]]
+                        )
+                        st.session_state.import_audit_result["missing"] = []
+                        st.session_state.import_audit_result["missing_parsed"] = []
+                        st.rerun()
             else:
                 st.success("You own all cards in this list!")
         st.divider()
@@ -3506,9 +3791,8 @@ elif page == "📥 Import Decklist":
             conn.close()
 
             # Batch fetch all cards in the decklist via Scryfall Batch Collection API
-            all_card_names = [c[1] for c in parsed_cards]
-            with st.spinner(f"Resolving {len(all_card_names)} cards via Scryfall Batch API..."):
-                card_cache_map = batch_fetch_scryfall_cards(all_card_names)
+            with st.spinner(f"Resolving {len(parsed_cards)} cards via Scryfall Batch API..."):
+                card_cache_map = batch_fetch_scryfall_cards(parsed_cards)
 
             # Auto-assign detected commanders (without duplicate copies!)
             if commanders:
@@ -3517,20 +3801,30 @@ elif page == "📥 Import Decklist":
                 if len(commanders) > 1:
                     set_deck_commander(deck_id, commanders[1], is_partner=True)
 
-            assigned, missing = [], []
+            assigned, missing, missing_parsed = [], [], []
 
-            # Deduplicate and aggregate quantities in imported decklist
-            card_qty_sum = {}
-            for q, raw_n in parsed_cards:
-                card_qty_sum[raw_n] = card_qty_sum.get(raw_n, 0) + q
-            aggregated_cards = [(q, raw_n) for raw_n, q in card_qty_sum.items()]
+            # Deduplicate and aggregate quantities in imported decklist while preserving printing info
+            card_items_map = {}
+            for item in parsed_cards:
+                q = getattr(item, "qty", item[0])
+                raw_n = getattr(item, "name", item[1])
+                s_c = getattr(item, "set_code", None)
+                c_n = getattr(item, "collector_number", None)
+                if raw_n not in card_items_map:
+                    card_items_map[raw_n] = {"qty": q, "name": raw_n, "set_code": s_c, "collector_number": c_n}
+                else:
+                    card_items_map[raw_n]["qty"] += q
 
-            for qty_needed, raw_card_name in aggregated_cards:
-                # Find canonical name
-                card_obj = card_cache_map.get(raw_card_name)
+            for raw_card_name, item_meta in card_items_map.items():
+                qty_needed = item_meta["qty"]
+                # Find canonical card
+                card_obj = card_cache_map.get(raw_card_name) \
+                        or card_cache_map.get(str(raw_card_name).lower())
                 canonical_name = card_obj["name"] if card_obj else raw_card_name
+                set_code = card_obj.get("set_code", item_meta.get("set_code")) if card_obj else item_meta.get("set_code")
+                collector_num = card_obj.get("collector_number", item_meta.get("collector_number")) if card_obj else item_meta.get("collector_number")
 
-                # If this card is already assigned as the commander, it's already in deck_cards with qty=1
+                # If this card is already assigned as commander, it's already in deck_cards with qty=1
                 canonical_commanders = [card_cache_map.get(c, {}).get('name', c) if isinstance(card_cache_map.get(c), dict) else c for c in commanders]
                 if canonical_name in commanders or canonical_name in canonical_commanders:
                     assigned.append({'Card': canonical_name, 'Qty Added': 1})
@@ -3551,16 +3845,20 @@ elif page == "📥 Import Decklist":
                         ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = ?
                     """, (int(deck_id), canonical_name, available, available))
                     assigned.append({'Card': canonical_name, 'Qty Added': available})
-                    missing.append({'Card': canonical_name, 'Shortage': qty_needed - available})
+                    shortage = qty_needed - available
+                    missing.append({'Card': canonical_name, 'Shortage': shortage})
+                    missing_parsed.append(ParsedCard(shortage, canonical_name, set_code, collector_num))
                 else:
                     missing.append({'Card': canonical_name, 'Shortage': qty_needed})
+                    missing_parsed.append(ParsedCard(qty_needed, canonical_name, set_code, collector_num))
 
             st.session_state.active_deck_id = deck_id
             st.session_state.import_audit_result = {
                 "deck_id": deck_id,
                 "deck_name": deck_name.strip(),
                 "assigned": assigned,
-                "missing": missing
+                "missing": missing,
+                "missing_parsed": missing_parsed
             }
             logger.info(f"Imported deck '{deck_name.strip()}' with {len(assigned)} assigned cards and {len(missing)} missing.")
             st.rerun()

@@ -101,15 +101,27 @@ if %ERRORLEVEL% EQU 0 (
 
 :TRY_POWERSHELL_INSTALL
 :: Attempt 2: Download official Python 3.12 installer and run silent setup
-echo [INFO] Downloading official Python 3.12 installer from python.org...
+set "PY_ARCH=amd64"
+if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "PY_ARCH=arm64"
+set "PY_URL=https://www.python.org/ftp/python/3.12.9/python-3.12.9-%PY_ARCH%.exe"
 set "TEMP_INSTALLER=%TEMP%\python_installer_312.exe"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe', $env:TEMP_INSTALLER)"
+where curl >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo [INFO] Downloading official Python 3.12 installer via curl...
+    curl -fSLo "%TEMP_INSTALLER%" "%PY_URL%"
+) else (
+    echo [INFO] Downloading official Python 3.12 installer via PowerShell...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('%PY_URL%', $env:TEMP_INSTALLER)"
+)
 
 if not exist "%TEMP_INSTALLER%" goto INSTALL_FAILED
 
 echo [INFO] Running silent Python installation...
-start /wait "" "%TEMP_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 SimpleInstall=1
+"%TEMP_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 SimpleInstall=1
+if %ERRORLEVEL% NEQ 0 (
+    echo [WARNING] Python installer finished with exit code %ERRORLEVEL%.
+)
 del "%TEMP_INSTALLER%" >nul 2>&1
 
 if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
@@ -118,6 +130,10 @@ if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
 )
 if exist "%ProgramFiles%\Python312\python.exe" (
     set "PY_CMD=%ProgramFiles%\Python312\python.exe"
+    goto PYTHON_FOUND
+)
+if exist "%LOCALAPPDATA%\Programs\Python\Launcher\py.exe" (
+    set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Launcher\py.exe"
     goto PYTHON_FOUND
 )
 py -0 >nul 2>&1
