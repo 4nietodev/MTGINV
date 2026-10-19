@@ -125,7 +125,19 @@ H. INSTALLER HARDENING (install.bat)
        - Open an existing deck, try adding a card with incompatible colors, verify it is blocked.
        - Import a sample decklist with (SET) NUM tags and verify art & compatibility audit.
 
+
+5. MULTI-PRINTING COLLECTION & GROUP BY NAME TOGGLE
+--------------------------------------------------------------------------------
+- Database Schema Migration:
+  - Migrated `collection` from `card_name UNIQUE` to composite unique key `UNIQUE(card_name, set_code, collector_number, is_foil)`.
+  - Added `set_code` and `collector_number` columns to `deck_cards` for tracking specific card printings in decks.
+  - Added `v_available_cards`: Consolidated view grouped by card name aggregating `SUM(total_owned)`, `SUM(foil_owned)`, and `printings_count`.
+  - Added `v_available_cards_printings`: Detailed per-printing view tracking exact physical prints and their availability.
+- "Group by Name" Toggles:
+  - Deck Builder Tab 1 ("Add Cards from Collection"): Toggle between aggregated drafting mode (shows all copies owned regardless of art, with a `🎨 X printings in binder` badge) and specific printing mode (shows each physical art, set tags `[SET #NUM]`, and per-art addition buttons).
+  - Binder Tab 3 ("Edit / Remove Cards"): Toggle between grouped view (shows total copies across all printings) and ungrouped view (shows each specific physical copy with its set, art, and finish steppers).
+  - Inventory Overview: Toggle between grouped card name totals and per-printing itemized breakdowns.
+
 ================================================================================
 END OF PROGRESS LOG
 ================================================================================
-

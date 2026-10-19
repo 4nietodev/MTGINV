@@ -69,10 +69,11 @@ def init_db():
         cursor.execute("ALTER TABLE card_cache ADD COLUMN is_foil INTEGER DEFAULT 0")
 
     # Physical Collection
+    # Check if collection table still has UNIQUE constraint strictly on card_name alone
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS collection (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        card_name TEXT UNIQUE NOT NULL,
+        card_name TEXT NOT NULL,
         total_owned INTEGER NOT NULL DEFAULT 1,
         cmc REAL,
         type_line TEXT,
@@ -83,11 +84,66 @@ def init_db():
         keywords TEXT,
         faces_json TEXT,
         produced_mana TEXT,
-        set_code TEXT,
-        collector_number TEXT,
+        set_code TEXT DEFAULT '',
+        collector_number TEXT DEFAULT '',
         is_foil INTEGER DEFAULT 0,
-        foil_owned INTEGER DEFAULT 0
+        foil_owned INTEGER DEFAULT 0,
+        UNIQUE(card_name, set_code, collector_number, is_foil)
     )""")
+
+    # Check for legacy unique index on card_name alone
+    cursor.execute("PRAGMA index_list(collection)")
+    idx_list = cursor.fetchall()
+    needs_migration = False
+    for idx in idx_list:
+        if idx[2] == 1:
+            cursor.execute(f"PRAGMA index_info({idx[1]})")
+            idx_cols = [row[2] for row in cursor.fetchall()]
+            if idx_cols == ["card_name"]:
+                needs_migration = True
+                break
+
+    if needs_migration:
+        logger.info("Migrating collection table to support multi-printing physical inventory...")
+        cursor.execute("DROP TABLE IF EXISTS collection_v2")
+        cursor.execute("""
+        CREATE TABLE collection_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_name TEXT NOT NULL,
+            total_owned INTEGER NOT NULL DEFAULT 1,
+            cmc REAL,
+            type_line TEXT,
+            color_identity TEXT,
+            image_url TEXT,
+            mana_cost TEXT,
+            oracle_text TEXT,
+            keywords TEXT,
+            faces_json TEXT,
+            produced_mana TEXT,
+            set_code TEXT DEFAULT '',
+            collector_number TEXT DEFAULT '',
+            is_foil INTEGER DEFAULT 0,
+            foil_owned INTEGER DEFAULT 0,
+            UNIQUE(card_name, set_code, collector_number, is_foil)
+        )""")
+        cursor.execute("""
+        INSERT OR IGNORE INTO collection_v2 (
+            id, card_name, total_owned, cmc, type_line, color_identity,
+            image_url, mana_cost, oracle_text, keywords, faces_json,
+            produced_mana, set_code, collector_number, is_foil, foil_owned
+        )
+        SELECT 
+            id, card_name, total_owned, cmc, type_line, color_identity,
+            image_url, mana_cost, oracle_text, keywords, faces_json,
+            produced_mana, COALESCE(set_code, ''), COALESCE(collector_number, ''),
+            COALESCE(is_foil, 0), COALESCE(foil_owned, 0)
+        FROM collection
+        """)
+        cursor.execute("DROP VIEW IF EXISTS v_available_cards")
+        cursor.execute("DROP VIEW IF EXISTS v_available_cards_printings")
+        cursor.execute("DROP TABLE collection")
+        cursor.execute("ALTER TABLE collection_v2 RENAME TO collection")
+        logger.info("Collection table migration completed.")
 
     # Check for missing columns in collection
     cursor.execute("PRAGMA table_info(collection)")
@@ -122,16 +178,58 @@ def init_db():
         deck_id INTEGER,
         card_name TEXT,
         quantity INTEGER NOT NULL DEFAULT 1,
+        set_code TEXT DEFAULT '',
+        collector_number TEXT DEFAULT '',
         PRIMARY KEY (deck_id, card_name),
         FOREIGN KEY (deck_id) REFERENCES decks(id) ON DELETE CASCADE,
         FOREIGN KEY (card_name) REFERENCES collection(card_name)
     )""")
 
-    # View for Available Cards (includes faces_json, produced_mana, set_code, collector_number, is_foil, foil_owned)
+    cursor.execute("PRAGMA table_info(deck_cards)")
+    dc_cols = [col[1] for col in cursor.fetchall()]
+    if "set_code" not in dc_cols:
+        cursor.execute("ALTER TABLE deck_cards ADD COLUMN set_code TEXT DEFAULT ''")
+    if "collector_number" not in dc_cols:
+        cursor.execute("ALTER TABLE deck_cards ADD COLUMN collector_number TEXT DEFAULT ''")
+
+    # Grouped View: Aggregates multiple physical printings per card name
     cursor.execute("DROP VIEW IF EXISTS v_available_cards")
     cursor.execute("""
     CREATE VIEW v_available_cards AS
     SELECT 
+        c.card_name,
+        MAX(c.cmc) AS cmc,
+        MAX(c.type_line) AS type_line,
+        MAX(c.color_identity) AS color_identity,
+        MAX(c.image_url) AS image_url,
+        MAX(c.mana_cost) AS mana_cost,
+        MAX(c.oracle_text) AS oracle_text,
+        MAX(c.keywords) AS keywords,
+        MAX(c.faces_json) AS faces_json,
+        MAX(c.produced_mana) AS produced_mana,
+        MAX(c.set_code) AS set_code,
+        MAX(c.collector_number) AS collector_number,
+        MAX(c.is_foil) AS is_foil,
+        SUM(c.foil_owned) AS foil_owned,
+        SUM(c.total_owned) AS total_owned,
+        COALESCE(d.total_assigned, 0) AS total_assigned,
+        (SUM(c.total_owned) - COALESCE(d.total_assigned, 0)) AS quantity_available,
+        COUNT(c.id) AS printings_count
+    FROM collection c
+    LEFT JOIN (
+        SELECT card_name, SUM(quantity) AS total_assigned 
+        FROM deck_cards 
+        GROUP BY card_name
+    ) d ON c.card_name = d.card_name
+    GROUP BY c.card_name
+    """)
+
+    # Per-Printing View: Shows distinct physical printings with their individual availability
+    cursor.execute("DROP VIEW IF EXISTS v_available_cards_printings")
+    cursor.execute("""
+    CREATE VIEW v_available_cards_printings AS
+    SELECT 
+        c.id AS collection_id,
         c.card_name,
         c.cmc,
         c.type_line,
@@ -147,11 +245,28 @@ def init_db():
         c.is_foil,
         c.foil_owned,
         c.total_owned,
-        COALESCE(SUM(dc.quantity), 0) AS total_assigned,
-        (c.total_owned - COALESCE(SUM(dc.quantity), 0)) AS quantity_available
+        COALESCE(dp.assigned_qty, 0) AS printing_assigned,
+        MAX(0, MIN(c.total_owned - COALESCE(dp.assigned_qty, 0), g.total_owned - COALESCE(d_all.total_assigned, 0))) AS quantity_available,
+        COALESCE(d_all.total_assigned, 0) AS total_assigned,
+        (g.total_owned - COALESCE(d_all.total_assigned, 0)) AS name_available
     FROM collection c
-    LEFT JOIN deck_cards dc ON c.card_name = dc.card_name
-    GROUP BY c.card_name
+    LEFT JOIN (
+        SELECT card_name, UPPER(COALESCE(set_code, '')) as set_code, UPPER(COALESCE(collector_number, '')) as collector_number, SUM(quantity) AS assigned_qty
+        FROM deck_cards
+        GROUP BY card_name, UPPER(COALESCE(set_code, '')), UPPER(COALESCE(collector_number, ''))
+    ) dp ON c.card_name = dp.card_name 
+        AND UPPER(COALESCE(c.set_code, '')) = dp.set_code
+        AND UPPER(COALESCE(c.collector_number, '')) = dp.collector_number
+    LEFT JOIN (
+        SELECT card_name, SUM(quantity) AS total_assigned
+        FROM deck_cards
+        GROUP BY card_name
+    ) d_all ON c.card_name = d_all.card_name
+    LEFT JOIN (
+        SELECT card_name, SUM(total_owned) AS total_owned
+        FROM collection
+        GROUP BY card_name
+    ) g ON c.card_name = g.card_name
     """)
     conn.commit()
     conn.close()
@@ -403,18 +518,25 @@ def fetch_card_autocomplete(query):
 
 
 
-def update_card_printing(card_name, card_data):
+def update_card_printing(card_name, card_data, collection_id=None):
     """Updates the chosen printing / artwork for a card in the collection and card_cache."""
     img_url = card_data.get("image_url", "")
     faces_json = card_data.get("faces_json")
-    set_code = card_data.get("set_code", "")
-    col_num = card_data.get("collector_number", "")
+    set_code = (card_data.get("set_code") or "").upper().strip()
+    col_num = str(card_data.get("collector_number") or "").strip()
 
-    execute_db("""
-        UPDATE collection 
-        SET image_url = ?, faces_json = ?, set_code = ?, collector_number = ?
-        WHERE card_name = ?
-    """, (img_url, faces_json, set_code, col_num, card_name))
+    if collection_id:
+        execute_db("""
+            UPDATE collection 
+            SET image_url = ?, faces_json = ?, set_code = ?, collector_number = ?
+            WHERE id = ?
+        """, (img_url, faces_json, set_code, col_num, collection_id))
+    else:
+        execute_db("""
+            UPDATE collection 
+            SET image_url = ?, faces_json = ?, set_code = ?, collector_number = ?
+            WHERE card_name = ?
+        """, (img_url, faces_json, set_code, col_num, card_name))
 
     execute_db("""
         UPDATE card_cache 
@@ -922,21 +1044,36 @@ def execute_db(query, params=()):
 
 def add_card_to_collection(card_name, qty, printing_data=None, is_foil=0):
     """Adds or increases card count in the collection table, tracking foil and specific printing if specified."""
-    card_data = printing_data if printing_data else fetch_scryfall_data(card_name)
+    if printing_data is None:
+        # Check if user already owns a printing of this card
+        existing_p = run_query("SELECT set_code, collector_number, image_url, faces_json FROM collection WHERE card_name = ? LIMIT 1", (card_name,))
+        if not existing_p.empty and pd.notna(existing_p.iloc[0].get('set_code')) and str(existing_p.iloc[0].get('set_code')).strip():
+            row_p = existing_p.iloc[0]
+            card_data = fetch_scryfall_data(card_name)
+            if card_data:
+                card_data = dict(card_data)
+                card_data['set_code'] = str(row_p['set_code']).strip()
+                card_data['collector_number'] = str(row_p['collector_number']).strip()
+                if row_p.get('image_url'):
+                    card_data['image_url'] = row_p['image_url']
+        else:
+            card_data = fetch_scryfall_data(card_name)
+    else:
+        card_data = printing_data
+
     if card_data:
         name = card_data["name"]
-        set_code = card_data.get("set_code", "")
-        collector_number = card_data.get("collector_number", "")
+        set_code = (card_data.get("set_code") or "").upper().strip()
+        collector_number = str(card_data.get("collector_number") or "").strip()
         foil_val = 1 if is_foil else 0
         foil_add = qty if is_foil else 0
 
         execute_db("""
             INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number, is_foil, foil_owned) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(card_name) DO UPDATE SET 
-                total_owned = total_owned + ?,
-                foil_owned = foil_owned + ?,
-                is_foil = CASE WHEN excluded.is_foil = 1 THEN 1 ELSE collection.is_foil END,
+            ON CONFLICT(card_name, set_code, collector_number, is_foil) DO UPDATE SET 
+                total_owned = total_owned + excluded.total_owned,
+                foil_owned = foil_owned + excluded.foil_owned,
                 cmc = excluded.cmc,
                 type_line = excluded.type_line,
                 color_identity = excluded.color_identity,
@@ -945,13 +1082,11 @@ def add_card_to_collection(card_name, qty, printing_data=None, is_foil=0):
                 oracle_text = CASE WHEN excluded.oracle_text IS NOT NULL AND excluded.oracle_text != '' THEN excluded.oracle_text ELSE collection.oracle_text END,
                 keywords = CASE WHEN excluded.keywords IS NOT NULL AND excluded.keywords != '' THEN excluded.keywords ELSE collection.keywords END,
                 faces_json = CASE WHEN excluded.faces_json IS NOT NULL AND excluded.faces_json != '' THEN excluded.faces_json ELSE collection.faces_json END,
-                produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END,
-                set_code = CASE WHEN excluded.set_code IS NOT NULL AND excluded.set_code != '' THEN excluded.set_code ELSE collection.set_code END,
-                collector_number = CASE WHEN excluded.collector_number IS NOT NULL AND excluded.collector_number != '' THEN excluded.collector_number ELSE collection.collector_number END
+                produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END
         """, (name, qty, card_data["cmc"], card_data["type_line"], card_data["color_identity"],
               card_data.get("image_url"), card_data.get("mana_cost"), card_data.get("oracle_text", ""), card_data.get("keywords", ""),
               card_data.get("faces_json"), card_data.get("produced_mana", ""), set_code, collector_number,
-              foil_val, foil_add, qty, foil_add))
+              foil_val, foil_add))
         save_to_card_cache(card_data)
         logger.info(f"Added {qty}x '{name}' [{set_code} #{collector_number}] (Foil: {foil_val}) to collection.")
         return name
@@ -1006,10 +1141,9 @@ def batch_add_cards_to_collection(parsed_items):
                 cursor.execute("""
                     INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number, is_foil, foil_owned) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(card_name) DO UPDATE SET 
-                        total_owned = total_owned + ?,
-                        foil_owned = foil_owned + ?,
-                        is_foil = CASE WHEN excluded.is_foil = 1 THEN 1 ELSE collection.is_foil END,
+                    ON CONFLICT(card_name, set_code, collector_number, is_foil) DO UPDATE SET 
+                        total_owned = total_owned + excluded.total_owned,
+                        foil_owned = foil_owned + excluded.foil_owned,
                         cmc = excluded.cmc,
                         type_line = excluded.type_line,
                         color_identity = excluded.color_identity,
@@ -1018,13 +1152,11 @@ def batch_add_cards_to_collection(parsed_items):
                         oracle_text = CASE WHEN excluded.oracle_text IS NOT NULL AND excluded.oracle_text != '' THEN excluded.oracle_text ELSE collection.oracle_text END,
                         keywords = CASE WHEN excluded.keywords IS NOT NULL AND excluded.keywords != '' THEN excluded.keywords ELSE collection.keywords END,
                         faces_json = CASE WHEN excluded.faces_json IS NOT NULL AND excluded.faces_json != '' THEN excluded.faces_json ELSE collection.faces_json END,
-                        produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END,
-                        set_code = CASE WHEN excluded.set_code IS NOT NULL AND excluded.set_code != '' THEN excluded.set_code ELSE collection.set_code END,
-                        collector_number = CASE WHEN excluded.collector_number IS NOT NULL AND excluded.collector_number != '' THEN excluded.collector_number ELSE collection.collector_number END
+                        produced_mana = CASE WHEN excluded.produced_mana IS NOT NULL AND excluded.produced_mana != '' THEN excluded.produced_mana ELSE collection.produced_mana END
                 """, (canonical, qty, card_info["cmc"], card_info["type_line"], card_info["color_identity"],
                       card_info.get("image_url"), card_info.get("mana_cost"), card_info.get("oracle_text", ""), card_info.get("keywords", ""),
-                      card_info.get("faces_json"), card_info.get("produced_mana", ""), set_code, collector_number,
-                      item_is_foil, foil_add, qty, foil_add))
+                      card_info.get("faces_json"), card_info.get("produced_mana", ""), (set_code or "").upper().strip(), str(collector_number or "").strip(),
+                      item_is_foil, foil_add))
                 successful.append({
                     "Card": canonical, 
                     "Qty Added": qty, 
@@ -1180,11 +1312,12 @@ def get_deck_color_identity(deck_id):
     return ci
 
 
-def add_card_to_deck(deck_id, card_name, qty=1):
+def add_card_to_deck(deck_id, card_name, qty=1, set_code=None, collector_number=None):
     """
     Adds a card copy to deck.
     Strictly enforces that the card matches the Commander's (and Partner's / Background's)
     color identity. Incompatible cards cannot be added to the deck.
+    Optionally associates with a physical set_code and collector_number.
     Returns (success: bool, error_message: str | None).
     """
     deck_ci = get_deck_color_identity(deck_id)
@@ -1197,11 +1330,17 @@ def add_card_to_deck(deck_id, card_name, qty=1):
             logger.warning(f"Blocked adding '{card_name}' to deck {deck_id}: {msg}")
             return False, msg
 
+    s_code = (set_code or "").upper().strip()
+    c_num = str(collector_number or "").strip()
+
     execute_db("""
-        INSERT INTO deck_cards (deck_id, card_name, quantity) 
-        VALUES (?, ?, ?)
-        ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = quantity + ?
-    """, (deck_id, card_name, qty, qty))
+        INSERT INTO deck_cards (deck_id, card_name, quantity, set_code, collector_number) 
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(deck_id, card_name) DO UPDATE SET 
+            quantity = quantity + excluded.quantity,
+            set_code = CASE WHEN excluded.set_code != '' THEN excluded.set_code ELSE deck_cards.set_code END,
+            collector_number = CASE WHEN excluded.collector_number != '' THEN excluded.collector_number ELSE deck_cards.collector_number END
+    """, (deck_id, card_name, qty, s_code, c_num))
     return True, None
 
 
@@ -1756,23 +1895,26 @@ def render_deck_display(deck_id, deck_name):
     else:
         combined_ci = None
 
-    # Fetch deck cards (including faces_json)
+    # Fetch deck cards (including faces_json, grouping by card_name to prevent printing duplicates)
     df_deck = run_query("""
         SELECT 
             dc.card_name,
             dc.quantity,
-            COALESCE(c.cmc, 0.0) AS cmc,
-            COALESCE(c.type_line, 'Other') AS type_line,
-            COALESCE(c.color_identity, '') AS color_identity,
-            c.image_url,
-            COALESCE(c.mana_cost, '') AS mana_cost,
-            COALESCE(c.oracle_text, '') AS oracle_text,
-            COALESCE(c.keywords, '') AS keywords,
-            c.faces_json,
-            COALESCE(c.produced_mana, '') AS produced_mana
+            COALESCE(MAX(c.cmc), 0.0) AS cmc,
+            COALESCE(MAX(c.type_line), 'Other') AS type_line,
+            COALESCE(MAX(c.color_identity), '') AS color_identity,
+            MAX(CASE WHEN dc.set_code != '' AND UPPER(c.set_code) = UPPER(dc.set_code) THEN c.image_url ELSE c.image_url END) AS image_url,
+            COALESCE(MAX(c.mana_cost), '') AS mana_cost,
+            COALESCE(MAX(c.oracle_text), '') AS oracle_text,
+            COALESCE(MAX(c.keywords), '') AS keywords,
+            MAX(c.faces_json) AS faces_json,
+            COALESCE(MAX(c.produced_mana), '') AS produced_mana,
+            dc.set_code,
+            dc.collector_number
         FROM deck_cards dc
         LEFT JOIN collection c ON dc.card_name = c.card_name
         WHERE dc.deck_id = ?
+        GROUP BY dc.card_name
         ORDER BY dc.card_name ASC
     """, (deck_id,))
 
@@ -2070,23 +2212,63 @@ def render_deck_display(deck_id, deck_name):
 
         st.subheader("Add Cards to Deck from Collection")
 
-        df_col = run_query("""
-            SELECT 
-                card_name,
-                cmc,
-                type_line,
-                color_identity,
-                image_url,
-                mana_cost,
-                oracle_text,
-                keywords,
-                faces_json,
-                total_owned,
-                total_assigned,
-                quantity_available
-            FROM v_available_cards
-            ORDER BY card_name ASC
-        """)
+        col_group_tgl, col_search_txt, col_type_sel, col_avail_chk, col_hide_deck, col_grid_cols = st.columns([1.5, 2.5, 1.5, 1.5, 1.5, 1.0])
+        with col_group_tgl:
+            deck_add_grouped = st.toggle("Group by Name", value=True, key=f"deck_add_group_{deck_id}", help="Group multiple printings into a single card for drafting. Toggle off to inspect and select specific printings/art.")
+        with col_search_txt:
+            s_term = st.text_input("Search Collection (Name, Text, Keyword)", placeholder="e.g. Sol Ring, Flying, Draw...", key=f"col_search_{deck_id}")
+        with col_type_sel:
+            t_choice = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key=f"col_cat_{deck_id}")
+        with col_avail_chk:
+            only_avail = st.checkbox("Only unassigned (>0)", value=False, key=f"only_free_{deck_id}", help="Only show cards that currently have copies available in binder")
+        with col_hide_deck:
+            hide_in_deck = st.checkbox("Hide cards in deck", value=True, key=f"hide_deck_cards_{deck_id}", help="Do not show cards that are already in this deck")
+        with col_grid_cols:
+            grid_cols_num = st.selectbox("Cards/Row", [3, 4, 5, 6], index=1, key=f"col_grid_n_{deck_id}")
+
+        if deck_add_grouped:
+            df_col = run_query("""
+                SELECT 
+                    card_name,
+                    cmc,
+                    type_line,
+                    color_identity,
+                    image_url,
+                    mana_cost,
+                    oracle_text,
+                    keywords,
+                    faces_json,
+                    set_code,
+                    collector_number,
+                    total_owned,
+                    total_assigned,
+                    quantity_available,
+                    printings_count
+                FROM v_available_cards
+                ORDER BY card_name ASC
+            """)
+        else:
+            df_col = run_query("""
+                SELECT 
+                    collection_id,
+                    card_name,
+                    cmc,
+                    type_line,
+                    color_identity,
+                    image_url,
+                    mana_cost,
+                    oracle_text,
+                    keywords,
+                    faces_json,
+                    set_code,
+                    collector_number,
+                    total_owned,
+                    printing_assigned AS total_assigned,
+                    quantity_available,
+                    1 AS printings_count
+                FROM v_available_cards_printings
+                ORDER BY card_name ASC, set_code ASC
+            """)
 
         if df_col.empty:
             st.info("Your collection binder is empty! Add cards to your binder in **My Binder** first.")
@@ -2104,18 +2286,6 @@ def render_deck_display(deck_id, deck_name):
             if df_legal.empty:
                 st.warning("No cards in your collection match this deck's color identity. Add matching cards in **My Binder**!")
             else:
-                col_search_txt, col_type_sel, col_avail_chk, col_hide_deck, col_grid_cols = st.columns([3, 2, 2, 2, 1])
-                with col_search_txt:
-                    s_term = st.text_input("Search Collection (Name, Text, Keyword)", placeholder="e.g. Sol Ring, Flying, Draw...", key=f"col_search_{deck_id}")
-                with col_type_sel:
-                    t_choice = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key=f"col_cat_{deck_id}")
-                with col_avail_chk:
-                    only_avail = st.checkbox("Only unassigned (>0)", value=False, key=f"only_free_{deck_id}", help="Only show cards that currently have copies available in binder")
-                with col_hide_deck:
-                    hide_in_deck = st.checkbox("Hide cards in deck", value=True, key=f"hide_deck_cards_{deck_id}", help="Do not show cards that are already in this deck")
-                with col_grid_cols:
-                    grid_cols_num = st.selectbox("Cards/Row", [3, 4, 5, 6], index=1, key=f"col_grid_n_{deck_id}")
-
                 filtered_legal = df_legal.copy()
                 cards_already_in_deck = set(df_deck['card_name'].tolist()) if not df_deck.empty else set()
                 if hide_in_deck:
@@ -2181,6 +2351,9 @@ def render_deck_display(deck_id, deck_name):
                                     free_qty = int(card_row['quantity_available'])
                                     total_qty = int(card_row['total_owned'])
                                     is_basic = c_name.lower().strip() in BASIC_LANDS
+                                    c_set = str(card_row.get('set_code') or '').strip().upper()
+                                    c_num = str(card_row.get('collector_number') or '').strip()
+                                    p_count = int(card_row.get('printings_count', 1))
 
                                     # Check deck presence
                                     already_in_deck = 0
@@ -2196,7 +2369,11 @@ def render_deck_display(deck_id, deck_name):
                                         st.caption("Image unavailable")
 
                                     st.markdown(f"**{card_disp['name']}**")
-                                    st.caption(f"{cost_lbl} • {card_disp['type_line']}")
+                                    set_lbl = f"`{c_set}` #{c_num} • " if c_set else ""
+                                    st.caption(f"{set_lbl}{cost_lbl} • {card_disp['type_line']}")
+
+                                    if deck_add_grouped and p_count > 1:
+                                        st.caption(f"🎨 **{p_count}** printings in binder")
 
                                     # Availability Badge
                                     if free_qty > 0:
@@ -2216,7 +2393,7 @@ def render_deck_display(deck_id, deck_name):
                                     with c_tool1:
                                         if has_faces:
                                             other_face_title = faces[1 - f_idx]["name"]
-                                            if st.button("Flip", key=f"g_flip_{deck_id}_{c_name}", help=f"Flip: {other_face_title}"):
+                                            if st.button("Flip", key=f"g_flip_{deck_id}_{c_name}_{idx}", help=f"Flip: {other_face_title}"):
                                                 toggle_card_face(c_name, scope=f"add_{deck_id}")
                                                 st.rerun()
                                         else:
@@ -2242,15 +2419,17 @@ def render_deck_display(deck_id, deck_name):
                                     if is_basic:
                                         col_bq, col_ba = st.columns([1, 2])
                                         with col_bq:
-                                            b_qty_in = st.number_input("Qty", min_value=1, max_value=99, value=1, step=1, key=f"g_bqty_{deck_id}_{c_name}", label_visibility="collapsed")
+                                            b_qty_in = st.number_input("Qty", min_value=1, max_value=99, value=1, step=1, key=f"g_bqty_{deck_id}_{c_name}_{idx}", label_visibility="collapsed")
                                         with col_ba:
-                                            if st.button("Add", key=f"g_add_basic_{deck_id}_{c_name}", use_container_width=True):
-                                                add_card_to_deck(deck_id, c_name, b_qty_in)
+                                            if st.button("Add", key=f"g_add_basic_{deck_id}_{c_name}_{idx}", use_container_width=True):
+                                                add_card_to_deck(deck_id, c_name, b_qty_in, set_code=c_set, collector_number=c_num)
                                                 st.toast(f"Added {b_qty_in}x {c_name} to deck!")
                                                 st.rerun()
                                     else:
-                                        if st.button("Add to Deck", key=f"g_add_{deck_id}_{c_name}", use_container_width=True):
-                                            add_card_to_deck(deck_id, c_name, 1)
+                                        btn_lbl = "Add to Deck" if deck_add_grouped else f"Add {c_set} Art"
+                                        btn_key = f"g_add_{deck_id}_{c_name}_{idx}" if deck_add_grouped else f"g_add_{deck_id}_{c_name}_{c_set}_{c_num}_{idx}"
+                                        if st.button(btn_lbl, key=btn_key, use_container_width=True):
+                                            add_card_to_deck(deck_id, c_name, 1, set_code=c_set, collector_number=c_num)
                                             if free_qty <= 0:
                                                 st.toast(f"Added {c_name} (0 free in binder)")
                                             else:
@@ -3479,31 +3658,45 @@ if page == "📚 My Binder (Collection)":
         st.subheader("Manage Collection Quantities (Interactive Grid)")
         st.caption("Use the **- [qty] +** buttons on each card to increment or decrement physical copies owned.")
 
-        all_col_cards = run_query("""
-            SELECT card_name, total_owned, total_assigned, quantity_available, 
-                   faces_json, image_url, mana_cost, type_line, oracle_text, keywords, produced_mana,
-                   set_code, collector_number, is_foil, foil_owned
-            FROM v_available_cards 
-            ORDER BY card_name ASC
-        """)
+        col_group_tgl, col_gf1, col_gf2, col_gf3, col_gf4, col_gf5 = st.columns([1.5, 2.0, 1.2, 1.1, 1.1, 0.9])
+        with col_group_tgl:
+            binder_group_by_name = st.toggle("Group by Name", value=True, key="binder_group_by_name", help="Group multiple printings into a single card to see total copies owned.")
+        with col_gf1:
+            grid_search = st.text_input("Search Card (Name, Text)", placeholder="e.g. Sol Ring, Dragon...", key="edit_grid_search")
+        with col_gf2:
+            grid_cat = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key="edit_grid_cat")
+        with col_gf3:
+            grid_set = st.selectbox("Set Code", ["All Sets"], key="edit_grid_set_tmp")
+        with col_gf4:
+            grid_foil = st.selectbox("Finish", ["All Finishes", "Foil Only", "Non-Foil Only"], key="edit_grid_foil")
+        with col_gf5:
+            grid_cols_num = st.selectbox("Cards/Row", [3, 4, 5, 6], index=1, key="edit_grid_cols")
+
+        if binder_group_by_name:
+            all_col_cards = run_query("""
+                SELECT card_name, total_owned, total_assigned, quantity_available, 
+                       faces_json, image_url, mana_cost, type_line, oracle_text, keywords, produced_mana,
+                       set_code, collector_number, is_foil, foil_owned, printings_count
+                FROM v_available_cards 
+                ORDER BY card_name ASC
+            """)
+        else:
+            all_col_cards = run_query("""
+                SELECT collection_id, card_name, total_owned, printing_assigned AS total_assigned, quantity_available, 
+                       faces_json, image_url, mana_cost, type_line, oracle_text, keywords, produced_mana,
+                       set_code, collector_number, is_foil, foil_owned, 1 AS printings_count
+                FROM v_available_cards_printings 
+                ORDER BY card_name ASC, set_code ASC
+            """)
+
         if all_col_cards.empty:
             st.info("No cards in your binder yet. Add cards in **Add Single Card** or **Mass Add Cards**!")
         else:
-            # Filter bar for the grid
             distinct_sets = sorted(list({str(s).upper().strip() for s in all_col_cards['set_code'].dropna() if str(s).strip()}))
             set_options = ["All Sets"] + distinct_sets
-
-            col_gf1, col_gf2, col_gf3, col_gf4, col_gf5 = st.columns([2.2, 1.3, 1.2, 1.2, 1.0])
-            with col_gf1:
-                grid_search = st.text_input("Search Card (Name, Text)", placeholder="e.g. Sol Ring, Dragon...", key="edit_grid_search")
-            with col_gf2:
-                grid_cat = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key="edit_grid_cat")
-            with col_gf3:
-                grid_set = st.selectbox("Set Code", set_options, key="edit_grid_set")
-            with col_gf4:
-                grid_foil = st.selectbox("Finish", ["All Finishes", "Foil Only", "Non-Foil Only"], key="edit_grid_foil")
-            with col_gf5:
-                grid_cols_num = st.selectbox("Cards/Row", [3, 4, 5, 6], index=1, key="edit_grid_cols")
+            # Update set options in session or fallback
+            if grid_set not in set_options:
+                grid_set = "All Sets"
 
             filtered_grid = all_col_cards.copy()
             if grid_search:
@@ -3533,7 +3726,8 @@ if page == "📚 My Binder (Collection)":
             if filtered_grid.empty:
                 st.warning("No cards found matching your search filter.")
             else:
-                st.caption(f"Showing **{len(filtered_grid)}** cards in collection:")
+                mode_desc = "grouped unique titles" if binder_group_by_name else "individual printings"
+                st.caption(f"Showing **{len(filtered_grid)}** {mode_desc} in collection:")
                 grid_rows = [filtered_grid.iloc[i:i + grid_cols_num] for i in range(0, len(filtered_grid), grid_cols_num)]
                 for r_df in grid_rows:
                     cols = st.columns(grid_cols_num)
@@ -3544,6 +3738,8 @@ if page == "📚 My Binder (Collection)":
                             cur_assigned = int(row_c['total_assigned'])
                             cur_avail = int(row_c['quantity_available'])
                             cur_foil = int(row_c['foil_owned']) if pd.notna(row_c.get('foil_owned')) else 0
+                            col_id = row_c.get('collection_id')
+                            cur_p_count = int(row_c.get('printings_count', 1))
 
                             f_idx, bdisp, b_has_faces, b_faces = get_card_display_details(c_name, row_c, scope="binder_grid")
 
@@ -3553,8 +3749,14 @@ if page == "📚 My Binder (Collection)":
                                 st.caption("Image not available")
 
                             st.markdown(f"**{bdisp['name']}**")
+                            cur_s = str(row_c.get('set_code') or '').strip().upper()
+                            cur_num = str(row_c.get('collector_number') or '').strip()
+                            set_tag = f"`{cur_s} #{cur_num}` • " if cur_s else ""
                             cost_l = bdisp['mana_cost'] if bdisp['mana_cost'] else ""
-                            st.caption(f"{cost_l} • {bdisp['type_line']}")
+                            st.caption(f"{set_tag}{cost_l} • {bdisp['type_line']}")
+
+                            if binder_group_by_name and cur_p_count > 1:
+                                st.caption(f"🎨 **{cur_p_count}** arts owned")
 
                             if cur_avail > 0:
                                 st.caption(f"✅ **{cur_avail}** free / **{cur_assigned}** in decks")
@@ -3566,20 +3768,24 @@ if page == "📚 My Binder (Collection)":
 
                             # Stepper: [-]  {cur_owned}  [+]
                             c_dec, c_num, c_inc = st.columns([1, 1, 1])
+                            btn_suffix = f"_{col_id}" if col_id else f"_{c_name}"
                             with c_dec:
-                                if st.button("-1", key=f"b_dec_{c_name}", help="Remove 1 copy"):
+                                if st.button("-1", key=f"b_dec{btn_suffix}", help="Remove 1 copy"):
                                     if cur_owned > 1:
                                         new_q = cur_owned - 1
                                         new_f = min(cur_foil, new_q)
                                         is_f = 1 if new_f > 0 else 0
-                                        execute_db("UPDATE collection SET total_owned = ?, foil_owned = ?, is_foil = ? WHERE card_name = ?", (new_q, new_f, is_f, c_name))
-                                        if new_q < cur_assigned:
-                                            st.toast(f"{c_name} owned ({new_q}) is now less than assigned across decks ({cur_assigned})!")
+                                        if col_id:
+                                            execute_db("UPDATE collection SET total_owned = ?, foil_owned = ?, is_foil = ? WHERE id = ?", (new_q, new_f, is_f, col_id))
                                         else:
-                                            st.toast(f"Updated {c_name} to {new_q} copies!")
+                                            execute_db("UPDATE collection SET total_owned = ?, foil_owned = ?, is_foil = ? WHERE id = (SELECT id FROM collection WHERE card_name = ? ORDER BY total_owned DESC LIMIT 1)", (new_q, new_f, is_f, c_name))
+                                        st.toast(f"Updated {c_name} to {new_q} copies!")
                                     else:
-                                        execute_db("DELETE FROM deck_cards WHERE card_name = ?", (c_name,))
-                                        execute_db("DELETE FROM collection WHERE card_name = ?", (c_name,))
+                                        if col_id:
+                                            execute_db("DELETE FROM collection WHERE id = ?", (col_id,))
+                                        else:
+                                            execute_db("DELETE FROM deck_cards WHERE card_name = ?", (c_name,))
+                                            execute_db("DELETE FROM collection WHERE card_name = ?", (c_name,))
                                         st.toast(f"Removed {c_name} from binder!")
                                     st.rerun()
 
@@ -3587,9 +3793,12 @@ if page == "📚 My Binder (Collection)":
                                 st.markdown(f"<div style='text-align:center; font-size:1.25rem; font-weight:bold; padding-top:4px;'>{cur_owned}</div>", unsafe_allow_html=True)
 
                             with c_inc:
-                                if st.button("+1", key=f"b_inc_{c_name}", help="Add 1 copy"):
+                                if st.button("+1", key=f"b_inc{btn_suffix}", help="Add 1 copy"):
                                     new_q = cur_owned + 1
-                                    execute_db("UPDATE collection SET total_owned = ? WHERE card_name = ?", (new_q, c_name))
+                                    if col_id:
+                                        execute_db("UPDATE collection SET total_owned = ? WHERE id = ?", (new_q, col_id))
+                                    else:
+                                        execute_db("UPDATE collection SET total_owned = total_owned + 1 WHERE id = (SELECT id FROM collection WHERE card_name = ? ORDER BY total_owned DESC LIMIT 1)", (c_name,))
                                     st.toast(f"Updated {c_name} to {new_q} copies!")
                                     st.rerun()
 
@@ -3598,15 +3807,13 @@ if page == "📚 My Binder (Collection)":
                             with col_sub1:
                                 if b_has_faces:
                                     other_face_n = b_faces[1 - f_idx]["name"]
-                                    if st.button("Flip", key=f"b_flip_{c_name}", help=f"Flip: {other_face_n}"):
+                                    if st.button("Flip", key=f"b_flip{btn_suffix}", help=f"Flip: {other_face_n}"):
                                         toggle_card_face(c_name, scope="binder_grid")
                                         st.rerun()
                                 else:
                                     st.write("")
                             with col_sub2:
                                 with st.popover("Art", help="Change card printing / artwork or finish"):
-                                    cur_s = row_c.get("set_code") if hasattr(row_c, "get") else None
-                                    cur_num = row_c.get("collector_number") if hasattr(row_c, "get") else None
                                     if cur_s and cur_num:
                                         st.caption(f"Current: `{cur_s} #{cur_num}`")
                                     elif cur_s:
@@ -3620,23 +3827,29 @@ if page == "📚 My Binder (Collection)":
                                     cf1, cf2 = st.columns(2)
                                     with cf1:
                                         if cur_foil < cur_owned:
-                                            if st.button("+1 Foil", key=f"f_inc_{c_name}", help="Mark 1 copy as foil", use_container_width=True):
-                                                execute_db("UPDATE collection SET foil_owned = foil_owned + 1, is_foil = 1 WHERE card_name = ?", (c_name,))
+                                            if st.button("+1 Foil", key=f"f_inc{btn_suffix}", help="Mark 1 copy as foil", use_container_width=True):
+                                                if col_id:
+                                                    execute_db("UPDATE collection SET foil_owned = foil_owned + 1, is_foil = 1 WHERE id = ?", (col_id,))
+                                                else:
+                                                    execute_db("UPDATE collection SET foil_owned = foil_owned + 1, is_foil = 1 WHERE id = (SELECT id FROM collection WHERE card_name = ? ORDER BY total_owned DESC LIMIT 1)", (c_name,))
                                                 st.toast(f"Marked 1 copy of {c_name} as Foil!")
                                                 st.rerun()
                                     with cf2:
                                         if cur_foil > 0:
-                                            if st.button("-1 Foil", key=f"f_dec_{c_name}", help="Unmark 1 foil copy", use_container_width=True):
+                                            if st.button("-1 Foil", key=f"f_dec{btn_suffix}", help="Unmark 1 foil copy", use_container_width=True):
                                                 new_f = max(0, cur_foil - 1)
                                                 new_is_f = 1 if new_f > 0 else 0
-                                                execute_db("UPDATE collection SET foil_owned = ?, is_foil = ? WHERE card_name = ?", (new_f, new_is_f, c_name))
+                                                if col_id:
+                                                    execute_db("UPDATE collection SET foil_owned = ?, is_foil = ? WHERE id = ?", (new_f, new_is_f, col_id))
+                                                else:
+                                                    execute_db("UPDATE collection SET foil_owned = ?, is_foil = ? WHERE id = (SELECT id FROM collection WHERE card_name = ? ORDER BY total_owned DESC LIMIT 1)", (new_f, new_is_f, c_name))
                                                 st.toast(f"Unmarked 1 foil copy of {c_name}!")
                                                 st.rerun()
                                     st.divider()
 
-                                    art_key = f"view_art_{c_name}"
+                                    art_key = f"view_art{btn_suffix}"
                                     if not st.session_state.get(art_key, False):
-                                        if st.button("Browse Art", key=f"btn_open_art_{c_name}", use_container_width=True):
+                                        if st.button("Browse Art", key=f"btn_open_art{btn_suffix}", use_container_width=True):
                                             st.session_state[art_key] = True
                                             st.rerun()
                                     else:
@@ -3652,24 +3865,28 @@ if page == "📚 My Binder (Collection)":
                                                     except Exception:
                                                         st.caption("No image")
                                                     st.caption(f"**{p['set_code']} #{p['collector_number']}**\n{p['set_name']}")
-                                                    if st.button("Select", key=f"sel_art_{c_name}_{p['id']}_{p_idx}", use_container_width=True):
-                                                        update_card_printing(c_name, p["card_data"])
+                                                    if st.button("Select", key=f"sel_art_{c_name}_{p['id']}_{p_idx}_{idx}", use_container_width=True):
+                                                        update_card_printing(c_name, p["card_data"], collection_id=col_id)
                                                         st.session_state[art_key] = False
                                                         st.toast(f"Updated {c_name} to {p['set_code']} #{p['collector_number']}!")
                                                         st.rerun()
                                         else:
                                             st.info("No alternate printings found.")
-                                        if st.button("Close", key=f"close_art_{c_name}", use_container_width=True):
+                                        if st.button("Close", key=f"close_art{btn_suffix}", use_container_width=True):
                                             st.session_state[art_key] = False
                                             st.rerun()
                             with col_sub3:
-                                with st.popover("🗑️", help="Delete card completely"):
-                                    st.markdown(f"Delete **{c_name}** from collection?")
+                                with st.popover("🗑️", help="Delete card from binder"):
+                                    target_txt = "this physical printing" if col_id else "this card completely"
+                                    st.markdown(f"Delete **{c_name}** ({target_txt})?")
                                     if cur_assigned > 0:
                                         st.warning(f"{cur_assigned} copy/copies are in decks! Deleting removes them too.")
-                                    if st.button("Confirm Delete", key=f"del_pop_{c_name}", type="primary"):
-                                        execute_db("DELETE FROM deck_cards WHERE card_name = ?", (c_name,))
-                                        execute_db("DELETE FROM collection WHERE card_name = ?", (c_name,))
+                                    if st.button("Confirm Delete", key=f"del_pop{btn_suffix}", type="primary"):
+                                        if col_id:
+                                            execute_db("DELETE FROM collection WHERE id = ?", (col_id,))
+                                        else:
+                                            execute_db("DELETE FROM deck_cards WHERE card_name = ?", (c_name,))
+                                            execute_db("DELETE FROM collection WHERE card_name = ?", (c_name,))
                                         st.toast(f"Deleted {c_name}!")
                                         st.rerun()
                             st.divider()
@@ -3706,7 +3923,7 @@ if page == "📚 My Binder (Collection)":
     inv_sets = run_query("SELECT DISTINCT UPPER(set_code) as set_code FROM collection WHERE set_code IS NOT NULL AND set_code != '' ORDER BY set_code ASC")
     inv_set_options = ["All Sets"] + (inv_sets['set_code'].tolist() if not inv_sets.empty else [])
 
-    col_bs, col_bkw, col_bset, col_bfoil = st.columns([2, 1.5, 1.2, 1.2])
+    col_bs, col_bkw, col_bset, col_bfoil, col_bgroup = st.columns([2, 1.4, 1.1, 1.1, 1.1])
     with col_bs:
         binder_search = st.text_input("Search Binder (Card Name, Oracle Text)", placeholder="e.g. draw a card, counter target...", key="binder_search_input")
     with col_bkw:
@@ -3715,23 +3932,44 @@ if page == "📚 My Binder (Collection)":
         binder_set_filter = st.selectbox("Set Code", inv_set_options, key="binder_set_filter")
     with col_bfoil:
         binder_foil_filter = st.selectbox("Finish", ["All Finishes", "Foil Only", "Non-Foil Only"], key="binder_foil_filter")
+    with col_bgroup:
+        inv_group_toggle = st.toggle("Group", value=True, key="inv_group_toggle", help="Group identical cards across printings")
 
-    query_binder = """
-        SELECT 
-            card_name as 'Card', 
-            mana_cost as 'Mana Cost',
-            set_code as 'Set',
-            collector_number as '#',
-            type_line as 'Type', 
-            keywords as 'Keywords',
-            total_owned as 'Total Owned', 
-            foil_owned as 'Foil Copies',
-            total_assigned as 'In Decks', 
-            quantity_available as 'Available in Binder',
-            oracle_text
-        FROM v_available_cards
-        WHERE 1=1
-    """
+    if inv_group_toggle:
+        query_binder = """
+            SELECT 
+                card_name as 'Card', 
+                mana_cost as 'Mana Cost',
+                set_code as 'Set',
+                collector_number as '#',
+                type_line as 'Type', 
+                keywords as 'Keywords',
+                total_owned as 'Total Owned', 
+                foil_owned as 'Foil Copies',
+                total_assigned as 'In Decks', 
+                quantity_available as 'Available in Binder',
+                printings_count as 'Arts Owned',
+                oracle_text
+            FROM v_available_cards
+            WHERE 1=1
+        """
+    else:
+        query_binder = """
+            SELECT 
+                card_name as 'Card', 
+                set_code as 'Set',
+                collector_number as '#',
+                mana_cost as 'Mana Cost',
+                type_line as 'Type', 
+                keywords as 'Keywords',
+                total_owned as 'Total Owned', 
+                foil_owned as 'Foil Copies',
+                printing_assigned as 'In Decks', 
+                quantity_available as 'Available in Binder',
+                oracle_text
+            FROM v_available_cards_printings
+            WHERE 1=1
+        """
     params_binder = []
     if binder_search:
         query_binder += " AND (card_name LIKE ? OR oracle_text LIKE ?)"
@@ -3752,7 +3990,8 @@ if page == "📚 My Binder (Collection)":
     if not df_inventory.empty:
         disp_df = df_inventory.drop(columns=['oracle_text'], errors='ignore')
         st.dataframe(disp_df, use_container_width=True)
-        st.caption(f"Showing **{len(disp_df)}** unique card titles in your collection.")
+        count_lbl = "unique card titles" if inv_group_toggle else "physical printings"
+        st.caption(f"Showing **{len(disp_df)}** {count_lbl} in your collection.")
     else:
         st.info("Your binder is currently empty or no cards match your filters.")
 
