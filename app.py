@@ -3293,6 +3293,30 @@ if "nav_radio" not in st.session_state or st.session_state.nav_radio in ["🃏 D
 
 page = st.sidebar.radio("Navigation", NAV_PAGES, key="nav_radio")
 
+# Sidebar Database Backup
+with st.sidebar.expander("Database Backup", expanded=False):
+    st.caption("Export a snapshot of your collection and decks database.")
+    try:
+        if os.path.exists(DB_NAME):
+            conn_bck = sqlite3.connect(DB_NAME)
+            db_bytes = conn_bck.serialize()
+            conn_bck.close()
+            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label="Download Database Backup",
+                data=db_bytes,
+                file_name=f"mtg_inventory_backup_{timestamp_str}.db",
+                mime="application/x-sqlite3",
+                use_container_width=True,
+                help="Download full SQLite snapshot of mtg_inventory.db"
+            )
+            st.caption(f"Database size: {len(db_bytes) / 1024:.1f} KB")
+        else:
+            st.caption("No database found yet.")
+    except Exception as e:
+        logger.error(f"Error creating database backup snapshot: {e}")
+        st.error("Failed to generate database backup.")
+
 # Sidebar System Logs Viewer
 with st.sidebar.expander("System Logs", expanded=False):
     if os.path.exists(LOG_FILE):
@@ -3466,25 +3490,45 @@ if page == "📚 My Binder (Collection)":
             st.info("No cards in your binder yet. Add cards in **Add Single Card** or **Mass Add Cards**!")
         else:
             # Filter bar for the grid
-            col_gf1, col_gf2, col_gf3 = st.columns([2, 1, 1])
+            distinct_sets = sorted(list({str(s).upper().strip() for s in all_col_cards['set_code'].dropna() if str(s).strip()}))
+            set_options = ["All Sets"] + distinct_sets
+
+            col_gf1, col_gf2, col_gf3, col_gf4, col_gf5 = st.columns([2.2, 1.3, 1.2, 1.2, 1.0])
             with col_gf1:
-                grid_search = st.text_input("Search Card (Name, Text)", placeholder="e.g. Sol Ring, Dragon, Draw a card...", key="edit_grid_search")
+                grid_search = st.text_input("Search Card (Name, Text)", placeholder="e.g. Sol Ring, Dragon...", key="edit_grid_search")
             with col_gf2:
                 grid_cat = st.selectbox("Category", ["All Types", "Creatures", "Planeswalkers", "Instants", "Sorceries", "Artifacts", "Enchantments", "Lands"], key="edit_grid_cat")
             with col_gf3:
-                grid_cols_num = st.selectbox("Cards per Row", [3, 4, 5, 6], index=1, key="edit_grid_cols")
+                grid_set = st.selectbox("Set Code", set_options, key="edit_grid_set")
+            with col_gf4:
+                grid_foil = st.selectbox("Finish", ["All Finishes", "Foil Only", "Non-Foil Only"], key="edit_grid_foil")
+            with col_gf5:
+                grid_cols_num = st.selectbox("Cards/Row", [3, 4, 5, 6], index=1, key="edit_grid_cols")
 
             filtered_grid = all_col_cards.copy()
             if grid_search:
                 s_l = grid_search.lower().strip()
                 filtered_grid = filtered_grid[
-                    filtered_grid['card_name'].str.lower().str.contains(s_l) |
-                    filtered_grid['oracle_text'].fillna('').str.lower().str.contains(s_l) |
-                    filtered_grid['keywords'].fillna('').str.lower().str.contains(s_l)
+                    filtered_grid['card_name'].str.lower().str.contains(s_l, regex=False) |
+                    filtered_grid['oracle_text'].fillna('').str.lower().str.contains(s_l, regex=False) |
+                    filtered_grid['keywords'].fillna('').str.lower().str.contains(s_l, regex=False)
                 ]
             if grid_cat != "All Types":
                 filtered_grid['cat'] = filtered_grid['type_line'].apply(get_card_category)
                 filtered_grid = filtered_grid[filtered_grid['cat'] == grid_cat]
+
+            if grid_set != "All Sets":
+                filtered_grid = filtered_grid[filtered_grid['set_code'].fillna('').str.upper() == grid_set]
+
+            if grid_foil == "Foil Only":
+                filtered_grid = filtered_grid[
+                    (filtered_grid['foil_owned'].fillna(0) > 0) | 
+                    (filtered_grid['is_foil'].fillna(0) == 1)
+                ]
+            elif grid_foil == "Non-Foil Only":
+                filtered_grid = filtered_grid[
+                    (filtered_grid['total_owned'].fillna(0) - filtered_grid['foil_owned'].fillna(0) > 0)
+                ]
 
             if filtered_grid.empty:
                 st.warning("No cards found matching your search filter.")
@@ -3526,7 +3570,9 @@ if page == "📚 My Binder (Collection)":
                                 if st.button("-1", key=f"b_dec_{c_name}", help="Remove 1 copy"):
                                     if cur_owned > 1:
                                         new_q = cur_owned - 1
-                                        execute_db("UPDATE collection SET total_owned = ? WHERE card_name = ?", (new_q, c_name))
+                                        new_f = min(cur_foil, new_q)
+                                        is_f = 1 if new_f > 0 else 0
+                                        execute_db("UPDATE collection SET total_owned = ?, foil_owned = ?, is_foil = ? WHERE card_name = ?", (new_q, new_f, is_f, c_name))
                                         if new_q < cur_assigned:
                                             st.toast(f"{c_name} owned ({new_q}) is now less than assigned across decks ({cur_assigned})!")
                                         else:
@@ -3558,7 +3604,7 @@ if page == "📚 My Binder (Collection)":
                                 else:
                                     st.write("")
                             with col_sub2:
-                                with st.popover("Art", help="Change card printing / artwork"):
+                                with st.popover("Art", help="Change card printing / artwork or finish"):
                                     cur_s = row_c.get("set_code") if hasattr(row_c, "get") else None
                                     cur_num = row_c.get("collector_number") if hasattr(row_c, "get") else None
                                     if cur_s and cur_num:
@@ -3567,6 +3613,26 @@ if page == "📚 My Binder (Collection)":
                                         st.caption(f"Current: `{cur_s}`")
                                     else:
                                         st.caption("Current: Default Art")
+
+                                    # Foil finish adjustment
+                                    regular_owned = max(0, cur_owned - cur_foil)
+                                    st.caption(f"Finish: **{cur_foil}** foil / **{regular_owned}** regular")
+                                    cf1, cf2 = st.columns(2)
+                                    with cf1:
+                                        if cur_foil < cur_owned:
+                                            if st.button("+1 Foil", key=f"f_inc_{c_name}", help="Mark 1 copy as foil", use_container_width=True):
+                                                execute_db("UPDATE collection SET foil_owned = foil_owned + 1, is_foil = 1 WHERE card_name = ?", (c_name,))
+                                                st.toast(f"Marked 1 copy of {c_name} as Foil!")
+                                                st.rerun()
+                                    with cf2:
+                                        if cur_foil > 0:
+                                            if st.button("-1 Foil", key=f"f_dec_{c_name}", help="Unmark 1 foil copy", use_container_width=True):
+                                                new_f = max(0, cur_foil - 1)
+                                                new_is_f = 1 if new_f > 0 else 0
+                                                execute_db("UPDATE collection SET foil_owned = ?, is_foil = ? WHERE card_name = ?", (new_f, new_is_f, c_name))
+                                                st.toast(f"Unmarked 1 foil copy of {c_name}!")
+                                                st.rerun()
+                                    st.divider()
 
                                     art_key = f"view_art_{c_name}"
                                     if not st.session_state.get(art_key, False):
@@ -3637,11 +3703,18 @@ if page == "📚 My Binder (Collection)":
                 st.rerun()
 
     # Search and Filter Binder
-    col_bs, col_bkw = st.columns([2, 2])
+    inv_sets = run_query("SELECT DISTINCT UPPER(set_code) as set_code FROM collection WHERE set_code IS NOT NULL AND set_code != '' ORDER BY set_code ASC")
+    inv_set_options = ["All Sets"] + (inv_sets['set_code'].tolist() if not inv_sets.empty else [])
+
+    col_bs, col_bkw, col_bset, col_bfoil = st.columns([2, 1.5, 1.2, 1.2])
     with col_bs:
         binder_search = st.text_input("Search Binder (Card Name, Oracle Text)", placeholder="e.g. draw a card, counter target...", key="binder_search_input")
     with col_bkw:
         binder_kw_filter = st.text_input("Filter by Keyword", placeholder="e.g. Flying, Trample, Ward...", key="binder_kw_input")
+    with col_bset:
+        binder_set_filter = st.selectbox("Set Code", inv_set_options, key="binder_set_filter")
+    with col_bfoil:
+        binder_foil_filter = st.selectbox("Finish", ["All Finishes", "Foil Only", "Non-Foil Only"], key="binder_foil_filter")
 
     query_binder = """
         SELECT 
@@ -3652,6 +3725,7 @@ if page == "📚 My Binder (Collection)":
             type_line as 'Type', 
             keywords as 'Keywords',
             total_owned as 'Total Owned', 
+            foil_owned as 'Foil Copies',
             total_assigned as 'In Decks', 
             quantity_available as 'Available in Binder',
             oracle_text
@@ -3665,6 +3739,13 @@ if page == "📚 My Binder (Collection)":
     if binder_kw_filter:
         query_binder += " AND keywords LIKE ?"
         params_binder.append(f"%{binder_kw_filter}%")
+    if binder_set_filter != "All Sets":
+        query_binder += " AND UPPER(set_code) = ?"
+        params_binder.append(binder_set_filter)
+    if binder_foil_filter == "Foil Only":
+        query_binder += " AND (foil_owned > 0 OR is_foil = 1)"
+    elif binder_foil_filter == "Non-Foil Only":
+        query_binder += " AND (total_owned - foil_owned > 0)"
     query_binder += " ORDER BY card_name ASC"
 
     df_inventory = run_query(query_binder, params_binder)

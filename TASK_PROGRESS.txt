@@ -89,25 +89,43 @@ H. INSTALLER HARDENING (install.bat)
   * Scrubbed decorative emojis; aligned documentation.
 
 
-3. RESUMPTION CHECKLIST FOR TOMORROW
+3. COMPLETED ENHANCEMENTS
 --------------------------------------------------------------------------------
-When resuming tomorrow, you can directly build upon or refine:
+[x] 1. Filter binder by Foil vs Non-Foil:
+       - Tab 3 ("✏️ Edit / Remove Cards") filter bar includes "Finish" selector
+         ("All Finishes", "Foil Only", "Non-Foil Only").
+       - Current Inventory Status table includes "Finish" filter and "Foil Copies" column.
+       - Inline "Art" popover on cards now includes finish breakdown ("X foil / Y regular")
+         and quick "+1 Foil" / "-1 Foil" adjustment buttons.
+       - Decrementing copies with "-1" automatically clamps `foil_owned` safely.
 
+[x] 2. Filter binder by specific Set Code:
+       - Tab 3 filter bar dynamically extracts all distinct set codes in the collection
+         and provides a "Set Code" dropdown.
+       - Current Inventory Status table includes "Set Code" filter dropdown.
+
+[x] 3. Sidebar one-click local database backup:
+       - Added "Database Backup" expander in the sidebar.
+       - Safely serializes `mtg_inventory.db` without locking.
+       - Streamlit `st.download_button` exports timestamped `mtg_inventory_backup_YYYYMMDD_HHMMSS.db`.
+
+
+4. REMAINING RESUMPTION CHECKLIST
+--------------------------------------------------------------------------------
 [ ] 1. Run the local app:
        Command: streamlit run app.py
-       Or run: launch.bat
+       Or run: launch.bat / run.bat
 
 [ ] 2. Test user interactions in the browser:
        - Tab 1: Type "Sol R", click autocomplete suggestion, verify printings grid displays.
        - Add a card with "Foil" checked, verify badge appears in Tab 3.
+       - Tab 3: Test "Finish" (Foil/Non-Foil) and "Set Code" filter dropdowns.
+       - Tab 3: Open "Art" popover on a card, test "+1 Foil" / "-1 Foil" finish adjustment.
+       - Sidebar: Click "Database Backup" and download backup snapshot.
        - Open an existing deck, try adding a card with incompatible colors, verify it is blocked.
        - Import a sample decklist with (SET) NUM tags and verify art & compatibility audit.
-
-[ ] 3. Optional future enhancements (strictly aligned with physical binder philosophy):
-       - Allow filtering binder by Foil vs Non-Foil in Tab 3 filter bar.
-       - Allow filtering binder by specific Set Code in Tab 3 filter bar.
-       - Sidebar one-click local database backup (download mtg_collection.db).
 
 ================================================================================
 END OF PROGRESS LOG
 ================================================================================
+
