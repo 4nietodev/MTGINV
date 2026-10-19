@@ -1,0 +1,113 @@
+================================================================================
+MTGINV - TASK IMPLEMENTATION PROGRESS & RESUMPTION LOG
+Date: 2026-10-15
+Workspace: c:\Users\EM2025007806\PycharmProjects\MTGINV
+================================================================================
+
+1. EXECUTIVE SUMMARY & RECENT IMPLEMENTATIONS
+--------------------------------------------------------------------------------
+The following tasks and feature sets have been developed, integrated, and verified:
+
+A. CARD PRINTING & VISUAL ARTWORK SELECTION
+   - Users can choose the specific printing and see the exact physical artwork
+     when adding a card to their binder.
+   - Tab 1 ("➕ Add Single Card") includes "Browse & Choose Artwork", querying 
+     Scryfall for all distinct historical printings (`fetch_card_printings`) 
+     and displaying a responsive gallery with real images, set name, set code, 
+     collector number, and release year.
+   - Tab 3 ("✏️ Edit / Remove Cards") includes an inline "Art" popover on every card,
+     enabling users to inspect current printing and switch artwork with a single click.
+   - Database schema migrated with `set_code TEXT` and `collector_number TEXT` 
+     in `collection`, `card_cache`, and the `v_available_cards` view.
+
+B. ART RECOGNITION IN MASS ADD & DECK IMPORT
+   - `parse_card_line` and `ParsedCard` extract set codes and collector numbers from
+     lines like `1 Sol Ring (CMR) 351 *F*`, `1x Counterspell [EMA] 43`, `4 Lightning Bolt (M10)`.
+   - `ParsedCard` subclasses `tuple` for 100% backward compatibility with `(qty, name)`
+     unpacking across existing codebase while carrying metadata attributes.
+   - Batch lookup via Scryfall `/cards/collection` endpoint targets `{set, collector_number}`
+     identifiers to resolve physical prints.
+
+C. FOIL / FINISH TRACKING
+   - Added `is_foil INTEGER DEFAULT 0` and `foil_owned INTEGER DEFAULT 0` to `collection`
+     and `card_cache` tables, exposed via `v_available_cards`.
+   - Parser automatically detects `*F*`, `*foil*`, `*etched*`, `[foil]`, `(foil)`, and `#foil`.
+   - Tab 1 has an explicit "Foil" checkbox for adding single cards.
+   - Tab 2 records foil copies from mass text lists.
+   - Tab 3 displays a `✨ {foil_owned} foil of {total_owned} owned` badge on cards in the binder.
+   - Collection status inventory table shows `Foil Copies` column.
+
+D. LIVE SCRYFALL AUTOCOMPLETE
+   - Implemented `fetch_card_autocomplete(query)` with 1-hour `@st.cache_data`.
+   - Tab 1 ("➕ Add Single Card") provides real-time Scryfall suggestions as the user
+     types (≥ 2 characters) to prevent spelling mistakes.
+
+E. STRICT COMMANDER COLOR IDENTITY ENFORCEMENT
+   - Core philosophy: Incompatible mana in a Commander deck is strictly impossible to add.
+   - Implemented `get_deck_color_identity(deck_id)` computing combined legal color identity
+     (Primary Commander + Partner / Background).
+   - `add_card_to_deck(deck_id, card_name, qty)` validates `is_card_legal_for_commander`.
+     If a card violates the commander's color identity, addition is blocked and an error
+     is returned to the user.
+   - "📥 Import Decklist" audits all imported cards against the commander's color identity.
+     Incompatible cards are never added to `deck_cards` and are reported in a dedicated
+     "❌ Incompatible with Commander (Blocked)" audit section.
+
+F. MANA CURVE & ANALYTICS CONFIRMATION
+   - Verified Tab 4 ("📊 Mana Curve & Analytics"):
+     - Interactive CMC Mana Curve bar chart (0 to 7+)
+     - Card Types Breakdown bar chart
+     - Color Production vs Mana Pip Demand analysis
+     - Average CMC & Pip distribution metrics
+   - Everything remains intact and functional.
+
+G. EMOJI SCRUBBING
+   - All non-useful decorative emojis have been scrubbed.
+   - Preserved only approved functional symbols:
+     - Mana pips: ☀️, 🔵, ⚫, 🔴, 🟢, 🔘
+     - Navigation/selector tabs: 📚, 🎴, 📥, ➕, 🖼️, 📋, 📊, 🏔️, 🤖, 📤, 📦, ✏️
+     - Status indicators: ✅, ❌
+     - Actions: 🗑️, ◀, ▶
+
+H. INSTALLER HARDENING (install.bat)
+   - Added native curl check with PowerShell fallback.
+   - Architecture detection (AMD64 vs ARM64).
+   - Python 3.12.9 installer URL.
+   - Python Launcher detection in %LOCALAPPDATA%\Programs\Python\Launcher\py.exe.
+   - Exit code validation and temporary file cleanup.
+
+
+2. MODIFIED FILES & VERIFICATION STATUS
+--------------------------------------------------------------------------------
+- app.py:
+  * Syntax & compilation check: Passed (code 0)
+  * Emoji audit: All 24 symbols belong to approved functional categories.
+  * Test script execution: All parse, batch, printing, and DB tests passed.
+- install.bat:
+  * Updated and verified.
+- README.md:
+  * Scrubbed decorative emojis; aligned documentation.
+
+
+3. RESUMPTION CHECKLIST FOR TOMORROW
+--------------------------------------------------------------------------------
+When resuming tomorrow, you can directly build upon or refine:
+
+[ ] 1. Run the local app:
+       Command: streamlit run app.py
+       Or run: launch.bat
+
+[ ] 2. Test user interactions in the browser:
+       - Tab 1: Type "Sol R", click autocomplete suggestion, verify printings grid displays.
+       - Add a card with "Foil" checked, verify badge appears in Tab 3.
+       - Open an existing deck, try adding a card with incompatible colors, verify it is blocked.
+       - Import a sample decklist with (SET) NUM tags and verify art & compatibility audit.
+
+[ ] 3. Optional future enhancements (strictly aligned with physical binder philosophy):
+       - Allow filtering binder by Foil vs Non-Foil in Tab 3 filter bar.
+       - Allow filtering binder by specific Set Code in Tab 3 filter bar.
+       - Sidebar one-click local database backup (download mtg_collection.db).
+
+================================================================================
+END OF PROGRESS LOG
+================================================================================

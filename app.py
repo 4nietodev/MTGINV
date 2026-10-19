@@ -65,6 +65,8 @@ def init_db():
     for col in ["image_url", "mana_cost", "oracle_text", "keywords", "faces_json", "produced_mana", "set_code", "collector_number"]:
         if col not in cache_cols:
             cursor.execute(f"ALTER TABLE card_cache ADD COLUMN {col} TEXT")
+    if "is_foil" not in cache_cols:
+        cursor.execute("ALTER TABLE card_cache ADD COLUMN is_foil INTEGER DEFAULT 0")
 
     # Physical Collection
     cursor.execute("""
@@ -82,7 +84,9 @@ def init_db():
         faces_json TEXT,
         produced_mana TEXT,
         set_code TEXT,
-        collector_number TEXT
+        collector_number TEXT,
+        is_foil INTEGER DEFAULT 0,
+        foil_owned INTEGER DEFAULT 0
     )""")
 
     # Check for missing columns in collection
@@ -91,6 +95,10 @@ def init_db():
     for col in ["image_url", "mana_cost", "oracle_text", "keywords", "faces_json", "produced_mana", "set_code", "collector_number"]:
         if col not in cols:
             cursor.execute(f"ALTER TABLE collection ADD COLUMN {col} TEXT")
+    if "is_foil" not in cols:
+        cursor.execute("ALTER TABLE collection ADD COLUMN is_foil INTEGER DEFAULT 0")
+    if "foil_owned" not in cols:
+        cursor.execute("ALTER TABLE collection ADD COLUMN foil_owned INTEGER DEFAULT 0")
 
     # Decks (stores primary commander and partner/background commander)
     cursor.execute("""
@@ -119,7 +127,7 @@ def init_db():
         FOREIGN KEY (card_name) REFERENCES collection(card_name)
     )""")
 
-    # View for Available Cards (includes faces_json, produced_mana, set_code, collector_number)
+    # View for Available Cards (includes faces_json, produced_mana, set_code, collector_number, is_foil, foil_owned)
     cursor.execute("DROP VIEW IF EXISTS v_available_cards")
     cursor.execute("""
     CREATE VIEW v_available_cards AS
@@ -136,6 +144,8 @@ def init_db():
         c.produced_mana,
         c.set_code,
         c.collector_number,
+        c.is_foil,
+        c.foil_owned,
         c.total_owned,
         COALESCE(SUM(dc.quantity), 0) AS total_assigned,
         (c.total_owned - COALESCE(SUM(dc.quantity), 0)) AS quantity_available
@@ -366,6 +376,31 @@ def fetch_card_printings(card_name):
     except Exception as e:
         logger.warning(f"Error fetching printings for '{clean_name}': {e}")
     return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_card_autocomplete(query):
+    """
+    Fetches card name suggestions from Scryfall autocomplete catalog.
+    Strips leading quantities and set tags before querying.
+    """
+    if not query or len(str(query).strip()) < 2:
+        return []
+    clean_q = str(query).strip()
+    clean_q = re.sub(r'^\d+\s*x?\s+', '', clean_q).strip()
+    clean_q = re.split(r'[\(\[]', clean_q)[0].strip()
+    clean_q = re.sub(r'[\*#].*$', '', clean_q).strip()
+    if len(clean_q) < 2:
+        return []
+    try:
+        url = f"https://api.scryfall.com/cards/autocomplete?q={requests.utils.quote(clean_q)}"
+        resp = requests.get(url, headers=SCRYFALL_HEADERS, timeout=4)
+        if resp.status_code == 200:
+            return resp.json().get("data", [])
+    except Exception as e:
+        logger.debug(f"Autocomplete error for '{clean_q}': {e}")
+    return []
+
 
 
 def update_card_printing(card_name, card_data):
@@ -745,26 +780,28 @@ def get_card_category(type_line):
 class ParsedCard(tuple):
     """
     Subclass of tuple (qty, name) for complete backward compatibility with (qty, name) unpacking,
-    while carrying set_code and collector_number attributes for artwork recognition.
+    while carrying set_code, collector_number, and is_foil attributes for artwork and finish recognition.
     """
-    def __new__(cls, qty, name, set_code=None, collector_number=None):
+    def __new__(cls, qty, name, set_code=None, collector_number=None, is_foil=0):
         return super().__new__(cls, (qty, name))
 
-    def __init__(self, qty, name, set_code=None, collector_number=None):
+    def __init__(self, qty, name, set_code=None, collector_number=None, is_foil=0):
         self.qty = qty
         self.name = name
         self.set_code = set_code
         self.collector_number = collector_number
+        self.is_foil = 1 if is_foil else 0
 
     def __repr__(self):
         s_part = f" [{self.set_code.upper()} #{self.collector_number}]" if self.set_code else ""
-        return f"<ParsedCard {self.qty}x {self.name}{s_part}>"
+        f_part = " *F*" if self.is_foil else ""
+        return f"<ParsedCard {self.qty}x {self.name}{s_part}{f_part}>"
 
 
 def parse_card_line(line):
     """
     Parses lines like '4 Sol Ring', '1x Counterspell', '1 Sol Ring (CMR) 351 *F*',
-    or 'Brainstorm'. Returns ParsedCard(qty, clean_card_name, set_code, collector_number)
+    or 'Brainstorm'. Returns ParsedCard(qty, clean_card_name, set_code, collector_number, is_foil)
     or None if line is empty or comment.
     """
     if not line:
@@ -789,8 +826,14 @@ def parse_card_line(line):
     else:
         name_part = raw
 
-    # Strip foil / etched tags e.g. *F*, *foil*, #foil
+    # Detect foil / etched tags e.g. *F*, *foil*, #foil, [foil], (foil), *etched*
+    is_foil = 0
+    if re.search(r'(\*f\*|\*foil\*|#foil|\[foil\]|\(foil\)|\*etched\*)', raw, re.IGNORECASE):
+        is_foil = 1
+
+    # Strip foil / etched tags
     name_part = re.sub(r'[\*#].*$', '', name_part).strip()
+    name_part = re.sub(r'\s+\[foil\]|\s+\(foil\)', '', name_part, flags=re.IGNORECASE).strip()
 
     # Extract set codes & collector numbers e.g. "(CMR) 351", "[NEO] 22", "(MH2)"
     set_code = None
@@ -809,7 +852,7 @@ def parse_card_line(line):
 
     if not name_part:
         return None
-    return ParsedCard(qty, name_part, set_code, collector_num)
+    return ParsedCard(qty, name_part, set_code, collector_num, is_foil=is_foil)
 
 
 def parse_decklist_text(text):
@@ -877,18 +920,23 @@ def execute_db(query, params=()):
         conn.close()
 
 
-def add_card_to_collection(card_name, qty, printing_data=None):
-    """Adds or increases card count in the collection table, using specific printing/art if specified."""
+def add_card_to_collection(card_name, qty, printing_data=None, is_foil=0):
+    """Adds or increases card count in the collection table, tracking foil and specific printing if specified."""
     card_data = printing_data if printing_data else fetch_scryfall_data(card_name)
     if card_data:
         name = card_data["name"]
         set_code = card_data.get("set_code", "")
         collector_number = card_data.get("collector_number", "")
+        foil_val = 1 if is_foil else 0
+        foil_add = qty if is_foil else 0
+
         execute_db("""
-            INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number, is_foil, foil_owned) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(card_name) DO UPDATE SET 
                 total_owned = total_owned + ?,
+                foil_owned = foil_owned + ?,
+                is_foil = CASE WHEN excluded.is_foil = 1 THEN 1 ELSE collection.is_foil END,
                 cmc = excluded.cmc,
                 type_line = excluded.type_line,
                 color_identity = excluded.color_identity,
@@ -902,9 +950,10 @@ def add_card_to_collection(card_name, qty, printing_data=None):
                 collector_number = CASE WHEN excluded.collector_number IS NOT NULL AND excluded.collector_number != '' THEN excluded.collector_number ELSE collection.collector_number END
         """, (name, qty, card_data["cmc"], card_data["type_line"], card_data["color_identity"],
               card_data.get("image_url"), card_data.get("mana_cost"), card_data.get("oracle_text", ""), card_data.get("keywords", ""),
-              card_data.get("faces_json"), card_data.get("produced_mana", ""), set_code, collector_number, qty))
+              card_data.get("faces_json"), card_data.get("produced_mana", ""), set_code, collector_number,
+              foil_val, foil_add, qty, foil_add))
         save_to_card_cache(card_data)
-        logger.info(f"Added {qty}x '{name}' [{set_code} #{collector_number}] to collection.")
+        logger.info(f"Added {qty}x '{name}' [{set_code} #{collector_number}] (Foil: {foil_val}) to collection.")
         return name
     return None
 
@@ -933,6 +982,8 @@ def batch_add_cards_to_collection(parsed_items):
             raw_name = getattr(item, "name", item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else str(item))
             s_code = getattr(item, "set_code", None)
             c_num = getattr(item, "collector_number", None)
+            item_is_foil = getattr(item, "is_foil", 0)
+            foil_add = qty if item_is_foil else 0
 
             ident_key = f"{str(raw_name).lower()}|{str(s_code or '').lower()}|{str(c_num or '').lower()}"
 
@@ -953,10 +1004,12 @@ def batch_add_cards_to_collection(parsed_items):
                 set_code = card_info.get("set_code", "")
                 collector_number = card_info.get("collector_number", "")
                 cursor.execute("""
-                    INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO collection (card_name, total_owned, cmc, type_line, color_identity, image_url, mana_cost, oracle_text, keywords, faces_json, produced_mana, set_code, collector_number, is_foil, foil_owned) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(card_name) DO UPDATE SET 
                         total_owned = total_owned + ?,
+                        foil_owned = foil_owned + ?,
+                        is_foil = CASE WHEN excluded.is_foil = 1 THEN 1 ELSE collection.is_foil END,
                         cmc = excluded.cmc,
                         type_line = excluded.type_line,
                         color_identity = excluded.color_identity,
@@ -970,8 +1023,15 @@ def batch_add_cards_to_collection(parsed_items):
                         collector_number = CASE WHEN excluded.collector_number IS NOT NULL AND excluded.collector_number != '' THEN excluded.collector_number ELSE collection.collector_number END
                 """, (canonical, qty, card_info["cmc"], card_info["type_line"], card_info["color_identity"],
                       card_info.get("image_url"), card_info.get("mana_cost"), card_info.get("oracle_text", ""), card_info.get("keywords", ""),
-                      card_info.get("faces_json"), card_info.get("produced_mana", ""), set_code, collector_number, qty))
-                successful.append({"Card": canonical, "Qty Added": qty, "Set": set_code, "Number": collector_number})
+                      card_info.get("faces_json"), card_info.get("produced_mana", ""), set_code, collector_number,
+                      item_is_foil, foil_add, qty, foil_add))
+                successful.append({
+                    "Card": canonical, 
+                    "Qty Added": qty, 
+                    "Set": set_code, 
+                    "Number": collector_number,
+                    "Foil": "Yes" if item_is_foil else "No"
+                })
             else:
                 failed.append({"Card": raw_name, "Qty": qty})
 
@@ -1094,14 +1154,55 @@ def remove_card_from_deck(deck_id, card_name, remove_all=False):
     return True
 
 
+def get_deck_color_identity(deck_id):
+    """
+    Computes the legal Commander color identity for a deck
+    (Primary Commander + Partner / Background).
+    Returns a set of color letters e.g. {'W', 'U'}, set() for colorless,
+    or None if no Commander is assigned yet.
+    """
+    deck_meta = run_query("SELECT commander, partner_commander FROM decks WHERE id = ?", (int(deck_id),))
+    if deck_meta.empty:
+        return None
+    cmdr = deck_meta.iloc[0]["commander"]
+    if not cmdr or pd.isna(cmdr) or not str(cmdr).strip():
+        return None
+
+    cmdr_data = fetch_scryfall_data(cmdr)
+    ci = parse_color_identity(cmdr_data.get("color_identity", "")) if cmdr_data else set()
+
+    partner = deck_meta.iloc[0]["partner_commander"]
+    if partner and pd.notna(partner) and str(partner).strip():
+        p_data = fetch_scryfall_data(partner)
+        if p_data:
+            ci = ci.union(parse_color_identity(p_data.get("color_identity", "")))
+
+    return ci
+
+
 def add_card_to_deck(deck_id, card_name, qty=1):
-    """Adds a card copy to deck."""
+    """
+    Adds a card copy to deck.
+    Strictly enforces that the card matches the Commander's (and Partner's / Background's)
+    color identity. Incompatible cards cannot be added to the deck.
+    Returns (success: bool, error_message: str | None).
+    """
+    deck_ci = get_deck_color_identity(deck_id)
+    if deck_ci is not None:
+        card_data = fetch_scryfall_data(card_name)
+        card_ci_str = card_data.get("color_identity", "") if card_data else ""
+        if not is_card_legal_for_commander(card_name, card_ci_str, deck_ci):
+            ci_str = ", ".join(sorted(deck_ci)) if deck_ci else "Colorless"
+            msg = f"Cannot add '{card_name}' — its color identity is incompatible with your Commander ({ci_str})!"
+            logger.warning(f"Blocked adding '{card_name}' to deck {deck_id}: {msg}")
+            return False, msg
+
     execute_db("""
         INSERT INTO deck_cards (deck_id, card_name, quantity) 
         VALUES (?, ?, ?)
         ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = quantity + ?
     """, (deck_id, card_name, qty, qty))
-    return True
+    return True, None
 
 
 # ==========================================
@@ -3223,7 +3324,7 @@ if page == "📚 My Binder (Collection)":
     # --- TAB 1: SINGLE CARD ---
     with tab1:
         st.markdown("Search for an individual card to add to your collection.")
-        c_col1, c_col2 = st.columns([3, 1])
+        c_col1, c_col2, c_col3 = st.columns([3, 1, 1])
         with c_col1:
             new_card = st.text_input(
                 "Card Name",
@@ -3232,6 +3333,17 @@ if page == "📚 My Binder (Collection)":
             )
         with c_col2:
             qty = st.number_input("Quantity", min_value=1, value=1, key="single_card_qty_input")
+        with c_col3:
+            st.write("")
+            is_foil_chk = st.checkbox("Foil", key="single_card_is_foil", help="Check if your physical card is Foil / Etched")
+
+        # Live Autocomplete suggestions from Scryfall
+        if new_card and len(new_card.strip()) >= 2:
+            parsed_check = parse_card_line(new_card.strip())
+            if not parsed_check or not parsed_check.set_code:
+                sugs = fetch_card_autocomplete(new_card.strip())
+                if sugs and (len(sugs) > 1 or sugs[0].lower() != new_card.strip().lower()):
+                    st.caption("Suggestions: " + " • ".join([f"`{s}`" for s in sugs[:5]]))
 
         b_col1, b_col2, b_col3 = st.columns([1.5, 1.5, 2])
         with b_col1:
@@ -3244,24 +3356,27 @@ if page == "📚 My Binder (Collection)":
         # Handle Quick Add
         if btn_quick_add and new_card.strip():
             parsed_item = parse_card_line(f"{qty} {new_card.strip()}")
+            foil_flag = 1 if (is_foil_chk or (parsed_item and parsed_item.is_foil)) else 0
             if parsed_item and parsed_item.set_code:
                 with st.spinner("Finding specific printing on Scryfall..."):
                     res_map = batch_fetch_scryfall_cards([parsed_item])
                     card_data = res_map.get(str(parsed_item)) or res_map.get(parsed_item.name)
                     if card_data:
-                        added_name = add_card_to_collection(parsed_item.name, qty, printing_data=card_data)
+                        added_name = add_card_to_collection(parsed_item.name, qty, printing_data=card_data, is_foil=foil_flag)
                         s_code = card_data.get('set_code', '')
                         c_num = card_data.get('collector_number', '')
-                        st.success(f"Added {qty}x **{added_name}** [{s_code} #{c_num}] to your binder!")
+                        foil_txt = " (Foil)" if foil_flag else ""
+                        st.success(f"Added {qty}x **{added_name}** [{s_code} #{c_num}]{foil_txt} to your binder!")
                         st.rerun()
                     else:
                         st.error(f"Could not find printing [{parsed_item.set_code.upper()}] for '{parsed_item.name}'.")
             else:
                 target_name = parsed_item.name if parsed_item else new_card.strip()
                 with st.spinner(f"Looking up '{target_name}' on Scryfall..."):
-                    added_name = add_card_to_collection(target_name, qty)
+                    added_name = add_card_to_collection(target_name, qty, is_foil=foil_flag)
                     if added_name:
-                        st.success(f"Added {qty}x **{added_name}** to your binder!")
+                        foil_txt = " (Foil)" if foil_flag else ""
+                        st.success(f"Added {qty}x **{added_name}**{foil_txt} to your binder!")
                         st.rerun()
                     else:
                         st.error("Card not found on Scryfall. Check spelling!")
@@ -3343,7 +3458,7 @@ if page == "📚 My Binder (Collection)":
         all_col_cards = run_query("""
             SELECT card_name, total_owned, total_assigned, quantity_available, 
                    faces_json, image_url, mana_cost, type_line, oracle_text, keywords, produced_mana,
-                   set_code, collector_number
+                   set_code, collector_number, is_foil, foil_owned
             FROM v_available_cards 
             ORDER BY card_name ASC
         """)
@@ -3384,6 +3499,7 @@ if page == "📚 My Binder (Collection)":
                             cur_owned = int(row_c['total_owned'])
                             cur_assigned = int(row_c['total_assigned'])
                             cur_avail = int(row_c['quantity_available'])
+                            cur_foil = int(row_c['foil_owned']) if pd.notna(row_c.get('foil_owned')) else 0
 
                             f_idx, bdisp, b_has_faces, b_faces = get_card_display_details(c_name, row_c, scope="binder_grid")
 
@@ -3400,6 +3516,9 @@ if page == "📚 My Binder (Collection)":
                                 st.caption(f"✅ **{cur_avail}** free / **{cur_assigned}** in decks")
                             else:
                                 st.caption(f"❌ **0** free / **{cur_assigned}** in decks")
+
+                            if cur_foil > 0:
+                                st.caption(f"✨ **{cur_foil}** foil of **{cur_owned}** owned")
 
                             # Stepper: [-]  {cur_owned}  [+]
                             c_dec, c_num, c_inc = st.columns([1, 1, 1])
@@ -3751,27 +3870,17 @@ elif page == "📥 Import Decklist":
             else:
                 st.info("No cards matched your binder.")
         with col2:
-            st.subheader("❌ Missing from Collection")
+            st.subheader("❌ Not in Binder (Shortage)")
             if res["missing"]:
                 st.table(pd.DataFrame(res["missing"]))
-                if res.get("missing_parsed"):
-                    if st.button("Add All Missing Cards to Binder", key="btn_add_missing_audit", type="primary"):
-                        with st.spinner("Adding missing cards and artwork to your collection..."):
-                            batch_add_cards_to_collection(res["missing_parsed"])
-                            for item in res["missing_parsed"]:
-                                execute_db("""
-                                    INSERT INTO deck_cards (deck_id, card_name, quantity) VALUES (?, ?, ?)
-                                    ON CONFLICT(deck_id, card_name) DO UPDATE SET quantity = quantity + ?
-                                """, (int(d_id), item.name, item.qty, item.qty))
-                        st.toast(f"Added {len(res['missing_parsed'])} missing cards to your binder and assigned them to {d_name}!")
-                        st.session_state.import_audit_result["assigned"].extend(
-                            [{'Card': m['Card'], 'Qty Added': m['Shortage']} for m in res["missing"]]
-                        )
-                        st.session_state.import_audit_result["missing"] = []
-                        st.session_state.import_audit_result["missing_parsed"] = []
-                        st.rerun()
             else:
-                st.success("You own all cards in this list!")
+                st.success("You own all legal cards in this list!")
+
+        if res.get("incompatible"):
+            st.subheader("❌ Incompatible with Commander (Blocked)")
+            st.caption("The following cards were blocked from being added to the deck because their color identity is outside your Commander's allowed colors:")
+            st.table(pd.DataFrame(res["incompatible"]))
+
         st.divider()
 
     deck_name = st.text_input("Name for imported deck", key="inp_import_deck_name")
@@ -3801,7 +3910,10 @@ elif page == "📥 Import Decklist":
                 if len(commanders) > 1:
                     set_deck_commander(deck_id, commanders[1], is_partner=True)
 
-            assigned, missing, missing_parsed = [], [], []
+            assigned, missing, incompatible = [], [], []
+
+            # Compute combined commander color identity
+            deck_ci = get_deck_color_identity(deck_id)
 
             # Deduplicate and aggregate quantities in imported decklist while preserving printing info
             card_items_map = {}
@@ -3821,13 +3933,22 @@ elif page == "📥 Import Decklist":
                 card_obj = card_cache_map.get(raw_card_name) \
                         or card_cache_map.get(str(raw_card_name).lower())
                 canonical_name = card_obj["name"] if card_obj else raw_card_name
-                set_code = card_obj.get("set_code", item_meta.get("set_code")) if card_obj else item_meta.get("set_code")
-                collector_num = card_obj.get("collector_number", item_meta.get("collector_number")) if card_obj else item_meta.get("collector_number")
+                card_ci = card_obj.get("color_identity", "") if card_obj else ""
 
                 # If this card is already assigned as commander, it's already in deck_cards with qty=1
                 canonical_commanders = [card_cache_map.get(c, {}).get('name', c) if isinstance(card_cache_map.get(c), dict) else c for c in commanders]
                 if canonical_name in commanders or canonical_name in canonical_commanders:
                     assigned.append({'Card': canonical_name, 'Qty Added': 1})
+                    continue
+
+                # STRICT Commander Color Identity validation
+                if deck_ci is not None and not is_card_legal_for_commander(canonical_name, card_ci, deck_ci):
+                    ci_disp = ", ".join(sorted(deck_ci)) if deck_ci else "Colorless"
+                    incompatible.append({
+                        'Card': canonical_name,
+                        'Card Colors': card_ci or 'Colorless',
+                        'Reason': f"Incompatible with Commander ({ci_disp})"
+                    })
                     continue
 
                 df_avail = run_query("SELECT quantity_available FROM v_available_cards WHERE card_name = ?", (canonical_name,))
@@ -3847,10 +3968,8 @@ elif page == "📥 Import Decklist":
                     assigned.append({'Card': canonical_name, 'Qty Added': available})
                     shortage = qty_needed - available
                     missing.append({'Card': canonical_name, 'Shortage': shortage})
-                    missing_parsed.append(ParsedCard(shortage, canonical_name, set_code, collector_num))
                 else:
                     missing.append({'Card': canonical_name, 'Shortage': qty_needed})
-                    missing_parsed.append(ParsedCard(qty_needed, canonical_name, set_code, collector_num))
 
             st.session_state.active_deck_id = deck_id
             st.session_state.import_audit_result = {
@@ -3858,7 +3977,7 @@ elif page == "📥 Import Decklist":
                 "deck_name": deck_name.strip(),
                 "assigned": assigned,
                 "missing": missing,
-                "missing_parsed": missing_parsed
+                "incompatible": incompatible
             }
-            logger.info(f"Imported deck '{deck_name.strip()}' with {len(assigned)} assigned cards and {len(missing)} missing.")
+            logger.info(f"Imported deck '{deck_name.strip()}' with {len(assigned)} assigned cards, {len(missing)} missing, and {len(incompatible)} blocked.")
             st.rerun()
